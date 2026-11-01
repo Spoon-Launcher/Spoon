@@ -1,0 +1,14 @@
+# Rust
+/target
+**/*.rs.bk
+
+# IDEs
+.idea/
+.vscode/
+*.iml
+
+# Cross-compilation toolchains (fetched by scripts/build-linux.sh / build-macos.sh)
+/tools/
+
+# Packaged artifacts (scripts/build-* output)
+/dist/

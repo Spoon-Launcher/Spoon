@@ -1,0 +1,4 @@
+# Static CRT is a Windows packaging choice; applying it on Linux (static
+# glibc) or macOS is wrong or meaningless.
+[target.'cfg(target_os = "windows")']
+rustflags = ["-C", "target-feature=+crt-static"]
