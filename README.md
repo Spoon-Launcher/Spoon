@@ -4,6 +4,8 @@
 
 # Spoon
 
+🚧 **Development notice:** Spoon is still in development so expect bugs. Features may also be incomplete or change during development.
+
 Spoon is a free, open-source desktop app for creating and managing Minecraft servers. Built with
 Rust, Spoon brings server setup, live console control, monitoring, and file management together in
 one straightforward interface.
