@@ -6,6 +6,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use spoon_core::backup::{BackupInfo, BackupStore};
 use spoon_core::eula::{accept_eula, eula_state, EulaState};
 use spoon_core::files::{self, FileContent, FileEntry};
 use spoon_core::highlight::{self, Language, TokenKind};
@@ -132,6 +133,7 @@ enum ServerPage {
     Overview,
     Files,
     Players,
+    Backups,
     Settings,
 }
 
@@ -226,6 +228,7 @@ pub struct SpoonApp {
     add_dialog: Option<AddDialog>,
     settings_dialog: Option<SettingsDialog>,
     files_dialog: Option<FilesDialog>,
+    backups_dialog: Option<BackupsDialog>,
     confirm_remove: Option<usize>,
     /// Server index whose change-version modal is open.
     version_modal: Option<usize>,
@@ -244,6 +247,7 @@ pub struct SpoonApp {
     /// App-wide settings: which Java runtime launches servers (`None` = PATH).
     app_settings: AppSettings,
     java_store: Option<JavaStore>,
+    backup_store: Option<BackupStore>,
     /// Installed private runtimes, cached so rendering never rescans the disk
     /// per frame; refreshed once a second and after every install/uninstall.
     installed_runtimes: Vec<JavaRuntime>,
@@ -293,6 +297,7 @@ impl SpoonApp {
             add_dialog: None,
             settings_dialog: None,
             files_dialog: None,
+            backups_dialog: None,
             confirm_remove: None,
             version_modal: None,
             duplicate_task: None,
@@ -307,6 +312,7 @@ impl SpoonApp {
             global_error: None,
             app_settings,
             java_store,
+            backup_store: BackupStore::new(),
             installed_runtimes,
             runtimes_refreshed: Instant::now(),
             app_settings_open: false,
@@ -333,6 +339,7 @@ impl SpoonApp {
         self.page = ServerPage::Overview;
         self.settings_dialog = None;
         self.files_dialog = None;
+        self.backups_dialog = None;
         self.version_modal = None;
     }
 
@@ -358,6 +365,14 @@ impl SpoonApp {
             }
             ServerPage::Settings if self.settings_dialog.is_none() => {
                 self.settings_dialog = Some(SettingsDialog::new(&self.servers[index].config));
+            }
+            ServerPage::Backups if self.backups_dialog.is_none() => {
+                if let Some(store) = &self.backup_store {
+                    self.backups_dialog = Some(BackupsDialog::new(
+                        &self.servers[index].config,
+                        store.clone(),
+                    ));
+                }
             }
             _ => {}
         }
@@ -1156,6 +1171,7 @@ impl SpoonApp {
                         (ServerPage::Overview, theme::icons::SLIDERS, "Overview"),
                         (ServerPage::Files, theme::icons::FOLDER, "Files"),
                         (ServerPage::Players, theme::icons::USERS, "Players"),
+                        (ServerPage::Backups, theme::icons::ARCHIVE, "Backups"),
                         (ServerPage::Settings, theme::icons::GEAR, "Settings"),
                     ] {
                         let active = self.page == page;
@@ -1177,6 +1193,7 @@ impl SpoonApp {
                     ServerPage::Overview => self.render_overview_page(ui, index),
                     ServerPage::Players => self.render_players_page(ui, index),
                     ServerPage::Files => self.render_files_page(ui, index),
+                    ServerPage::Backups => self.render_backups_page(ui, index),
                     ServerPage::Settings => self.render_settings_page(ui, index),
                 }
             });
@@ -1828,8 +1845,10 @@ impl SpoonApp {
         }
         let name = self.servers[index].config.name.clone();
         // Only folders Spoon owns (created/duplicated under the servers dir)
-        // are deleted; imported servers keep their files.
+        // are deleted; imported servers keep their files. Backups always live
+        // in Spoon's own backups dir and are deleted with the server either way.
         let dir = self.servers[index].config.working_dir.clone();
+        let server_id = self.servers[index].config.id.clone();
         let managed = dir.starts_with(self.store.servers_dir());
         let mut remove = false;
         let mut close = false;
@@ -1852,9 +1871,11 @@ impl SpoonApp {
                 ui.add_space(6.0);
                 ui.label(
                     egui::RichText::new(if managed {
-                        format!("\"{name}\" and its files will be permanently deleted.")
+                        format!("\"{name}\", its files and its backups will be permanently deleted.")
                     } else {
-                        format!("\"{name}\" will be removed from Spoon. Its files stay on disk.")
+                        format!(
+                            "\"{name}\" will be removed from Spoon. Its files stay on disk, but its backups will be deleted."
+                        )
                     })
                     .color(theme::TEXT_MUTED),
                 );
@@ -1893,6 +1914,14 @@ impl SpoonApp {
                 }
             }
             if deleted {
+                if let Some(store) = &self.backup_store {
+                    if let Err(err) = store.remove_all(&server_id) {
+                        self.global_error = Some(format!(
+                            "Server removed, but its backups could not be deleted ({}): {err}",
+                            store.server_dir(&server_id).display()
+                        ));
+                    }
+                }
                 self.servers.remove(index);
                 if let Some(selected) = self.selected {
                     self.selected = if selected == index {
@@ -1907,6 +1936,7 @@ impl SpoonApp {
                     self.page = ServerPage::Overview;
                     self.settings_dialog = None;
                     self.files_dialog = None;
+                    self.backups_dialog = None;
                 }
                 self.save();
                 close = true;
@@ -3442,6 +3472,346 @@ impl SpoonApp {
         }
     }
 
+    /// Backups page: snapshot the server's folder into Spoon's backups
+    /// directory, browse past snapshots and delete ones no longer needed.
+    fn render_backups_page(&mut self, ui: &mut egui::Ui, index: usize) {
+        let server_index = index;
+        let server_id = self.servers[server_index].config.id.clone();
+        // Recreate the page state if it belongs to a different server.
+        let stale = self
+            .backups_dialog
+            .as_ref()
+            .map(|dialog| dialog.server_id != server_id)
+            .unwrap_or(true);
+        if stale {
+            self.backups_dialog = self
+                .backup_store
+                .as_ref()
+                .map(|store| BackupsDialog::new(&self.servers[server_index].config, store.clone()));
+        }
+
+        ui.label(theme::title_with_icon(
+            theme::icons::ARCHIVE,
+            "Backups",
+            theme::PRIMARY,
+        ));
+        ui.add_space(2.0);
+        ui.label(
+            egui::RichText::new(&self.servers[server_index].config.name)
+                .size(13.0)
+                .color(theme::TEXT_MUTED),
+        );
+        ui.add_space(14.0);
+
+        let Some(dialog) = self.backups_dialog.as_mut() else {
+            ui.label(
+                egui::RichText::new("Spoon could not determine its backups folder.")
+                    .color(theme::ERROR),
+            );
+            return;
+        };
+
+        if dialog.poll() {
+            // The server folder changed; re-read state Spoon caches from its files.
+            self.servers[server_index].max_players = read_max_players(&dialog.working_dir);
+        }
+        let running = self.servers[server_index].state() != ServerState::Stopped;
+        let busy = dialog.busy();
+        let mut create = false;
+        let mut open_folder = false;
+        let mut delete: Option<String> = None;
+        let mut cancel_delete = false;
+
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            if ui
+                .add_enabled(
+                    !running && !busy,
+                    theme::primary_icon_button(theme::icons::ARCHIVE, "Create backup"),
+                )
+                .on_hover_text("Zip the server folder into Spoon's backups folder")
+                .clicked()
+            {
+                create = true;
+            }
+            if busy {
+                ui.spinner();
+                let label = if dialog.create_task.is_some() {
+                    "Creating backup…"
+                } else {
+                    "Restoring backup…"
+                };
+                ui.label(egui::RichText::new(label).color(theme::TEXT_MUTED));
+            } else if running {
+                ui.label(
+                    egui::RichText::new("Stop the server to create or restore backups.")
+                        .color(theme::TEXT_MUTED),
+                );
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add(theme::ghost_icon_button(
+                        theme::icons::FOLDER_OPEN,
+                        "Open Folder",
+                    ))
+                    .on_hover_text("Reveal this server's backups in the file manager")
+                    .clicked()
+                {
+                    open_folder = true;
+                }
+                if ui
+                    .add(icon_toolbar_button(theme::icons::ROTATE))
+                    .on_hover_text("Refresh the list")
+                    .clicked()
+                {
+                    dialog.refresh();
+                }
+            });
+        });
+        if busy {
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
+        }
+        if let Some(err) = &dialog.error {
+            ui.label(egui::RichText::new(err).color(theme::ERROR));
+        }
+        if let Some(status) = &dialog.status {
+            ui.label(egui::RichText::new(status).color(theme::TEXT_MUTED));
+        }
+        ui.add_space(4.0);
+
+        if let Some(name) = dialog.confirm_delete.clone() {
+            theme::card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("Delete backup \"{name}\"?"))
+                            .color(theme::ERROR),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(theme::danger_icon_button(theme::icons::TRASH, "Delete"))
+                            .clicked()
+                        {
+                            delete = Some(name.clone());
+                        }
+                        if ui
+                            .add(theme::ghost_icon_button(theme::icons::XMARK, "Cancel"))
+                            .clicked()
+                        {
+                            cancel_delete = true;
+                        }
+                    });
+                });
+            });
+            ui.add_space(6.0);
+        }
+
+        // Take the listing out so row clicks can mutate dialog state; it is
+        // restored below (mirrors the files page).
+        let backups = std::mem::take(&mut dialog.backups);
+        let empty = backups.is_empty();
+        egui::ScrollArea::vertical()
+            .id_salt(("backups_list", &server_id))
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if empty {
+                    theme::card().show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.add_space(12.0);
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                theme::icon(theme::icons::ARCHIVE, 28.0).color(theme::TEXT_MUTED),
+                            );
+                            ui.add_space(6.0);
+                            ui.label(
+                                egui::RichText::new("No backups yet")
+                                    .size(16.0)
+                                    .strong()
+                                    .color(theme::TEXT),
+                            );
+                            ui.add_space(2.0);
+                            ui.label(
+                                egui::RichText::new(
+                                    "Create a backup to snapshot this server's files",
+                                )
+                                .size(12.5)
+                                .color(theme::TEXT_MUTED),
+                            );
+                        });
+                        ui.add_space(12.0);
+                    });
+                } else {
+                    theme::card().show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        for (position, backup) in backups.iter().enumerate() {
+                            if position > 0 {
+                                ui.separator();
+                            }
+                            let created = chrono::DateTime::<chrono::Local>::from(backup.created)
+                                .format("%Y-%m-%d %H:%M");
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                ui.label(
+                                    theme::icon(theme::icons::ARCHIVE, 15.0).color(theme::PRIMARY),
+                                );
+                                ui.vertical(|ui| {
+                                    ui.spacing_mut().item_spacing.y = 1.0;
+                                    ui.label(egui::RichText::new(&backup.name).color(theme::TEXT));
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{created}  ·  {}",
+                                            format_mb(backup.size_bytes)
+                                        ))
+                                        .size(12.0)
+                                        .color(theme::TEXT_MUTED),
+                                    );
+                                });
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .add(egui::Button::new(
+                                                theme::icon(theme::icons::TRASH, 13.0)
+                                                    .color(theme::ERROR),
+                                            ))
+                                            .on_hover_text("Delete this backup")
+                                            .clicked()
+                                        {
+                                            dialog.confirm_delete = Some(backup.name.clone());
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                !running && !busy,
+                                                egui::Button::new(
+                                                    theme::icon(theme::icons::RESTORE, 13.0)
+                                                        .color(theme::PRIMARY),
+                                                ),
+                                            )
+                                            .on_hover_text(
+                                                "Restore this backup into the server folder",
+                                            )
+                                            .clicked()
+                                        {
+                                            dialog.confirm_restore = Some(backup.name.clone());
+                                        }
+                                    },
+                                );
+                            });
+                        }
+                    });
+                }
+            });
+        dialog.backups = backups;
+
+        if create {
+            dialog.start_create();
+        }
+        if let Some(name) = delete {
+            dialog.delete_backup(&name);
+        }
+        if cancel_delete {
+            dialog.confirm_delete = None;
+        }
+        if open_folder {
+            reveal_in_folder(&dialog.store.server_dir(&dialog.server_id));
+        }
+
+        // Restore confirmation: the user picks whether the server folder is
+        // wiped before the archive is extracted.
+        if let Some(name) = dialog.confirm_restore.clone() {
+            let mut wipe: Option<bool> = None;
+            let mut close = false;
+            let busy = dialog.busy();
+            let modal = egui::Modal::new(egui::Id::new(("restore_backup_dialog", &server_id)))
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::SURFACE)
+                        .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
+                        .corner_radius(egui::CornerRadius::same(12))
+                        .inner_margin(egui::Margin::same(20)),
+                )
+                .backdrop_color(egui::Color32::from_black_alpha(140))
+                .show(ui.ctx(), |ui| {
+                    ui.set_width(460.0);
+                    ui.label(theme::title_with_icon(
+                        theme::icons::RESTORE,
+                        "Restore Backup",
+                        theme::PRIMARY,
+                    ));
+                    ui.add_space(2.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Restore \"{name}\" into \"{}\"?",
+                            dialog.server_name
+                        ))
+                        .size(13.0)
+                        .color(theme::TEXT_MUTED),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Restore next to the existing files, or replace everything in the server folder first. Restoring overwrites files with the same name.",
+                        )
+                        .size(12.5)
+                        .color(theme::TEXT_MUTED),
+                    );
+                    ui.add_space(16.0);
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add(theme::ghost_icon_button(theme::icons::XMARK, "Cancel"))
+                                .clicked()
+                            {
+                                close = true;
+                            }
+                            if ui
+                                .add_enabled(
+                                    !busy,
+                                    theme::secondary_icon_button(
+                                        theme::icons::RESTORE,
+                                        "Keep files & restore",
+                                    ),
+                                )
+                                .on_hover_text("Extract the backup next to the existing files")
+                                .clicked()
+                            {
+                                wipe = Some(false);
+                            }
+                            if ui
+                                .add_enabled(
+                                    !busy,
+                                    theme::danger_icon_button(
+                                        theme::icons::TRASH,
+                                        "Delete files & restore",
+                                    ),
+                                )
+                                .on_hover_text(
+                                    "Delete everything in the server folder first — cannot be undone",
+                                )
+                                .clicked()
+                            {
+                                wipe = Some(true);
+                            }
+                        });
+                    });
+                });
+            if modal.should_close() && !busy {
+                close = true;
+            }
+            match wipe {
+                Some(wipe) => {
+                    dialog.start_restore(&name, wipe);
+                    dialog.confirm_restore = None;
+                }
+                None => {
+                    if close {
+                        dialog.confirm_restore = None;
+                    }
+                }
+            }
+        }
+    }
+
     fn start_duplicate(&mut self, index: usize) {
         let Some(entry) = self.servers.get(index) else {
             return;
@@ -4897,6 +5267,148 @@ impl FilesDialog {
         self.open
             .as_ref()
             .is_some_and(|open| open.content != open.saved_content)
+    }
+}
+
+/// Backups page state for one server instance. The heavy zipping runs on a
+/// background thread so the UI never blocks.
+struct BackupsDialog {
+    server_id: String,
+    /// Cached from the server config so the create thread needs no app state.
+    server_name: String,
+    working_dir: PathBuf,
+    store: BackupStore,
+    backups: Vec<BackupInfo>,
+    create_task: Option<Receiver<Result<BackupInfo, String>>>,
+    restore_task: Option<Receiver<Result<String, String>>>,
+    /// Backup waiting for delete confirmation (file stem).
+    confirm_delete: Option<String>,
+    /// Backup waiting for the restore choice (file stem).
+    confirm_restore: Option<String>,
+    error: Option<String>,
+    status: Option<String>,
+}
+
+impl BackupsDialog {
+    fn new(config: &ServerConfig, store: BackupStore) -> Self {
+        let mut dialog = Self {
+            server_id: config.id.clone(),
+            server_name: config.name.clone(),
+            working_dir: config.working_dir.clone(),
+            store,
+            backups: Vec::new(),
+            create_task: None,
+            restore_task: None,
+            confirm_delete: None,
+            confirm_restore: None,
+            error: None,
+            status: None,
+        };
+        dialog.refresh();
+        dialog
+    }
+
+    fn busy(&self) -> bool {
+        self.create_task.is_some() || self.restore_task.is_some()
+    }
+
+    fn refresh(&mut self) {
+        self.backups = self.store.list(&self.server_id);
+    }
+
+    /// Zip the server folder into the backups directory on a background thread.
+    fn start_create(&mut self) {
+        if self.create_task.is_some() {
+            return;
+        }
+        self.error = None;
+        self.status = None;
+        let store = self.store.clone();
+        let server_id = self.server_id.clone();
+        let server_name = self.server_name.clone();
+        let working_dir = self.working_dir.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = store.create(&server_id, &server_name, &working_dir);
+            let _ = tx.send(result);
+        });
+        self.create_task = Some(rx);
+    }
+
+    /// Extract a backup into the server folder on a background thread.
+    /// `wipe` deletes everything in the server folder first.
+    fn start_restore(&mut self, name: &str, wipe: bool) {
+        if self.busy() {
+            return;
+        }
+        self.error = None;
+        self.status = None;
+        let store = self.store.clone();
+        let server_id = self.server_id.clone();
+        let name = name.to_string();
+        let working_dir = self.working_dir.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = store
+                .restore(&server_id, &name, &working_dir, wipe)
+                .map(|()| name.clone());
+            let _ = tx.send(result);
+        });
+        self.restore_task = Some(rx);
+    }
+
+    /// Drain finished create/restore tasks; refreshes the listing when a
+    /// backup was created. Returns true when a restore finished successfully,
+    /// so the caller can refresh state derived from the server folder.
+    fn poll(&mut self) -> bool {
+        if let Some(rx) = &self.create_task {
+            match rx.try_recv() {
+                Ok(Ok(backup)) => {
+                    self.create_task = None;
+                    self.status = Some(format!("Created {}", backup.name));
+                    self.refresh();
+                }
+                Ok(Err(err)) => {
+                    self.create_task = None;
+                    self.error = Some(err);
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.create_task = None;
+                    self.error = Some("Backup stopped unexpectedly.".to_string());
+                }
+            }
+        }
+        let mut restored = false;
+        if let Some(rx) = &self.restore_task {
+            match rx.try_recv() {
+                Ok(Ok(name)) => {
+                    self.restore_task = None;
+                    self.status = Some(format!("Restored {name}"));
+                    restored = true;
+                }
+                Ok(Err(err)) => {
+                    self.restore_task = None;
+                    self.error = Some(err);
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.restore_task = None;
+                    self.error = Some("Restore stopped unexpectedly.".to_string());
+                }
+            }
+        }
+        restored
+    }
+
+    fn delete_backup(&mut self, name: &str) {
+        match self.store.remove(&self.server_id, name) {
+            Ok(()) => {
+                self.confirm_delete = None;
+                self.refresh();
+            }
+            Err(err) => self.error = Some(err),
+        }
     }
 }
 

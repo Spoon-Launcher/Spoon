@@ -43,11 +43,12 @@ Status: ✅ Done · 🟡 In Progress · ⬜ Planned
 - 🟡 In-app update checker & downloader (GitHub Releases)
 - ⬜ Auto-restart on crash
 - ⬜ Scheduled restarts / tasks
-- ⬜ Backups (backup the server root folder under Spoon/backups)
+- ✅ Backups (backup the server root folder under Spoon/backups)
 - ⬜ Databases (Hook into a database server to allow creation of server specific databases)
 - ⬜ Desktop notifications (server up / down)
 - ⬜ Modrinth/Spigot Plugin Installer
 - ⬜ Modrinth/Curseforge Mod Installer
+- ⬜ Player Management
 - ✅ File Browser / File editor
 - ✅ Private Java runtimes — download/remove JDKs from inside the app (App Settings); they live in Spoon's own folder and don't touch the system Java
 - ⬜ Playit.gg Tunnel Support

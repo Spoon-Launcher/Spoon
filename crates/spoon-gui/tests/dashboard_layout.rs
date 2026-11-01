@@ -45,7 +45,7 @@ fn dashboard(
     ram_rect.set(Some(ui.add(egui::Button::new("RAM_MARKER")).rect));
     ui.add_space(10.0);
     ui.horizontal(|ui| {
-        for tab in ["Overview", "Files", "Players", "Settings"] {
+        for tab in ["Overview", "Files", "Players", "Backups", "Settings"] {
             ui.add(egui::Button::new(tab));
         }
         tab_rect.set(Some(ui.min_rect()));

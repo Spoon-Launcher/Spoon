@@ -22,6 +22,9 @@ Join the [Discord](https://discord.gg/7UEZnsMMkf) for updates and to talk with t
   browse command history.
 - **Monitor activity** — check CPU and memory usage, uptime, online players, and the server IP.
 - **Work with server files** — browse and edit files without leaving Spoon.
+- **Back up server files** — snapshot a server's folder into Spoon's backups
+  directory and restore a snapshot later, replacing the server folder or
+  merging into it; removing a server deletes its snapshots too.
 
 See [FEATURES.md](./FEATURES.md) for the full feature list and development status.
 

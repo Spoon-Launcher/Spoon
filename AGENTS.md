@@ -28,7 +28,9 @@ Cargo workspace (`resolver = "2"`) with two crates:
 `spoon-core` modules: `config` (server/app settings persistence), `process` (server child process,
 log stream, state), `mcjars` (MCJars API: software/version lists, jar download), `java` (private JDK
 runtimes), `eula`, `files` (file browser/editor helpers), `highlight` (syntax highlighting),
-`updater` (GitHub Releases update check/download).
+`backup` (server folder snapshots under `Spoon/backups/<server-id>/`, with
+restore), `updater` (GitHub Releases
+update check/download).
 
 `spoon-gui`: `app.rs` (all screens and app state — very large), `theme.rs` (colors, card styling,
 fonts), `main.rs` (entry point), `lib.rs` (exposes `app` and `theme` so tests can use them).
@@ -42,7 +44,7 @@ fonts), `main.rs` (entry point), `lib.rs` (exposes `app` and `theme` so tests ca
   reports back to the UI (see how existing features in `app.rs` do it). `reqwest` is used in
   `blocking` mode with `rustls-tls` (no OpenSSL) — keep it that way.
 - Persisted data lives under `dirs::config_dir()/Spoon` (`servers.json`, `settings.json`,
-  `servers/<name>/`, private JDKs). Use the `ServerStore`/`AppSettings` APIs and
+  `servers/<name>/`, `backups/<server-id>/`, private JDKs). Use the `ServerStore`/`AppSettings` APIs and
   `sanitize_folder_name`/`unique_server_dir` rather than building paths by hand.
 - Keep persisted structs backward compatible: new fields need `#[serde(default)]` so older
   `servers.json`/`settings.json` still load (there are tests for this in `config.rs`).

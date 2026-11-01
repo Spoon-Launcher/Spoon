@@ -220,6 +220,8 @@ pub mod icons {
     pub const TERMINAL: &str = "\u{f120}";
     pub const PAPER_PLANE: &str = "\u{f1d8}";
     pub const CLONE: &str = "\u{f24d}";
+    pub const RESTORE: &str = "\u{f0e2}";
+    pub const ARCHIVE: &str = "\u{f187}";
     pub const CHECK: &str = "\u{f00c}";
     pub const XMARK: &str = "\u{f00d}";
     pub const FILE: &str = "\u{f15b}";
