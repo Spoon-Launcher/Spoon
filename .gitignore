@@ -12,3 +12,6 @@
 
 # Packaged artifacts (scripts/build-* output)
 /dist/
+
+# StupidMacos
+.DS_Store
