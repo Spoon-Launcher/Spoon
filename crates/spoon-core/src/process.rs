@@ -78,6 +78,14 @@ impl ServerHandle {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+
+            // Java is a console-subsystem process; don't create a visible console window.
+            command.creation_flags(0x0800_0000);
+        }
+
         let mut child = command.spawn()?;
         let stdin = child.stdin.take();
 

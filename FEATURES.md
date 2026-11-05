@@ -40,7 +40,7 @@ Status: ✅ Done · 🟡 In Progress · ⬜ Planned
 
 ## Quality of Life
 
-- 🟡 In-app update checker & downloader (GitHub Releases)
+- 🟡 In-app update checker & downloader (Pulls from GitHub Releases)
 - ⬜ Auto-restart on crash
 - ⬜ Scheduled restarts / tasks
 - ✅ Backups (backup the server root folder under Spoon/backups)

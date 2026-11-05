@@ -1,6 +1,6 @@
 [package]
 name = "spoon-core"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
@@ -14,3 +14,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 tar = "0.4"
 zip = { version = "3", default-features = false, features = ["deflate"] }
+
+# Shortcut creation via IShellLink COM, done in-process instead of spawning
+# powershell (a pattern antimalware heuristics flag).
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+] }

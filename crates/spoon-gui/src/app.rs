@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use spoon_core::backup::{BackupInfo, BackupStore};
+use spoon_core::bootstrap;
 use spoon_core::eula::{accept_eula, eula_state, EulaState};
 use spoon_core::files::{self, FileContent, FileEntry};
 use spoon_core::highlight::{self, Language, TokenKind};
@@ -215,6 +216,90 @@ enum UpdateDownloadEvent {
     Done(Result<PathBuf, String>),
 }
 
+/// First-run managed-install flow (Windows release builds only): install the
+/// newer of the launched build and latest GitHub release, add shortcuts, then
+/// relaunch from the managed copy.
+enum Bootstrap {
+    None,
+    /// A managed copy exists but this launch came from somewhere else
+    /// (e.g. the original download); redirect to the managed executable.
+    Relaunch,
+    Setup(SetupState),
+    /// The managed copy was launched; the window closes once it is up.
+    Done,
+}
+
+enum SetupState {
+    Preparing {
+        rx: Receiver<UpdateDownloadEvent>,
+        downloaded: u64,
+        total: u64,
+    },
+    CreatingShortcuts {
+        rx: Receiver<Result<(), String>>,
+    },
+    Failed(String),
+}
+
+/// Prepare the managed install from the newer of the launched build and the
+/// latest GitHub release. The resulting executable path arrives on the channel.
+fn start_managed_setup() -> SetupState {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let client = UpdateClient::new(env!("CARGO_PKG_VERSION"));
+        let result: Result<PathBuf, String> = (|| {
+            let info = client
+                .latest()
+                .map_err(|err| err.to_string())?
+                .ok_or_else(|| "no published release found for this platform".to_string())?;
+            if client.current_version_is_newer_than(&info.release.version) {
+                return bootstrap::place_running_exe();
+            }
+            let dest = bootstrap::install_dir()
+                .ok_or_else(|| "could not determine the Spoon folder".to_string())?;
+            let downloaded = client
+                .download(&info.asset, &dest, &mut |downloaded, total| {
+                    let _ = tx.send(UpdateDownloadEvent::Progress(downloaded, total));
+                })
+                .map_err(|err| err.to_string())?;
+            bootstrap::place_downloaded_exe(&downloaded)
+        })();
+        let _ = tx.send(UpdateDownloadEvent::Done(result));
+    });
+    SetupState::Preparing {
+        rx,
+        downloaded: 0,
+        total: 0,
+    }
+}
+
+/// Spawn the background creation of the desktop / start-menu shortcuts once
+/// the managed executable has been prepared.
+fn start_shortcuts(managed: PathBuf) -> SetupState {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(bootstrap::create_shortcuts(&managed));
+    });
+    SetupState::CreatingShortcuts { rx }
+}
+
+/// Launch the managed executable and move to `Bootstrap::Done` (or report the
+/// failure as a setup error).
+fn launch_managed_bootstrap() -> Bootstrap {
+    let Some(exe) = bootstrap::managed_exe() else {
+        return Bootstrap::Setup(SetupState::Failed(
+            "could not determine the managed executable path".to_string(),
+        ));
+    };
+    match bootstrap::launch(&exe) {
+        Ok(_) => Bootstrap::Done,
+        Err(err) => Bootstrap::Setup(SetupState::Failed(format!(
+            "could not start {}: {err}",
+            exe.display()
+        ))),
+    }
+}
+
 pub struct SpoonApp {
     splash: Option<Splash>,
     logo: Option<egui::TextureHandle>,
@@ -241,6 +326,11 @@ pub struct SpoonApp {
     /// `UpdateInfo` kept while a download is running or failed, so the dialog
     /// can offer "Retry" without re-checking the API.
     update_info: Option<UpdateInfo>,
+    bootstrap: Bootstrap,
+    bootstrap_positioned: bool,
+    /// Set once an update apply has been handed off (or attempted), so the
+    /// window-close hook and the dialog button can't both fire.
+    apply_started: bool,
     system: System,
     last_metrics_refresh: Instant,
     global_error: Option<String>,
@@ -272,6 +362,38 @@ impl SpoonApp {
         let selected = (!servers.is_empty()).then_some(0);
         let logo = load_logo(&cc.egui_ctx, LOGO_PNG, "spoon_logo");
         let logo_hover = load_logo(&cc.egui_ctx, LOGO_HOVER_PNG, "spoon_logo_hover");
+        // First-run managed install: either set up the managed copy (download
+        // into the Spoon folder, shortcuts, relaunch) or redirect a stray
+        // launch straight to the managed copy. Either way the bootstrap
+        // screen replaces the splash and uses a small decorated window.
+        let bootstrap = if bootstrap::needs_first_run_setup() {
+            Bootstrap::Setup(start_managed_setup())
+        } else if bootstrap::should_relaunch_from_managed() {
+            Bootstrap::Relaunch
+        } else {
+            Bootstrap::None
+        };
+        let bootstrap_active = !matches!(bootstrap, Bootstrap::None);
+        // Managed installs: sweep the pre-rename executable and the
+        // moved-aside update copy; if one was removed the old shortcuts may
+        // point at a name that no longer exists, so refresh them.
+        if bootstrap::running_from_managed() {
+            if let Ok(current) = std::env::current_exe() {
+                std::thread::spawn(move || {
+                    if bootstrap::cleanup_install_leftovers(&current) {
+                        let _ = bootstrap::create_shortcuts(&current);
+                    }
+                });
+            }
+        }
+        if bootstrap_active {
+            cc.egui_ctx
+                .send_viewport_cmd(egui::ViewportCommand::Decorations(true));
+            cc.egui_ctx
+                .send_viewport_cmd(egui::ViewportCommand::Resizable(false));
+            cc.egui_ctx
+                .send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(520.0, 320.0)));
+        }
         let (icon_tx, icon_rx) = mpsc::channel();
         let (update_tx, update_rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -286,7 +408,11 @@ impl SpoonApp {
             .map(|store| store.list())
             .unwrap_or_default();
         Self {
-            splash: load_splash(&cc.egui_ctx),
+            splash: if bootstrap_active {
+                None
+            } else {
+                load_splash(&cc.egui_ctx)
+            },
             logo,
             logo_hover,
             store,
@@ -307,6 +433,9 @@ impl SpoonApp {
             update_dialog_open: false,
             update_skipped: None,
             update_info: None,
+            bootstrap,
+            bootstrap_positioned: false,
+            apply_started: false,
             system: System::new(),
             last_metrics_refresh: Instant::now(),
             global_error: None,
@@ -544,6 +673,203 @@ impl SpoonApp {
         };
     }
 
+    /// Drive the first-run setup state machine: prepare events, then the
+    /// shortcut task, then hand off to the managed copy.
+    fn poll_bootstrap(&mut self, ctx: &egui::Context) {
+        enum Advance {
+            Downloaded(PathBuf),
+            DownloadFailed(String),
+            ShortcutsDone,
+            ShortcutsFailed(String),
+        }
+        let advance = match &mut self.bootstrap {
+            Bootstrap::Setup(SetupState::Preparing { rx, .. }) => {
+                let mut progress = None;
+                let mut finished = None;
+                for event in rx.try_iter() {
+                    match event {
+                        UpdateDownloadEvent::Progress(done, size) => progress = Some((done, size)),
+                        UpdateDownloadEvent::Done(result) => finished = Some(result),
+                    }
+                }
+                if let (
+                    Some((done, size)),
+                    Bootstrap::Setup(SetupState::Preparing {
+                        downloaded, total, ..
+                    }),
+                ) = (progress, &mut self.bootstrap)
+                {
+                    *downloaded = done;
+                    *total = size;
+                }
+                ctx.request_repaint_after(Duration::from_millis(200));
+                finished.map(|result| match result {
+                    Ok(path) => Advance::Downloaded(path),
+                    Err(err) => Advance::DownloadFailed(err),
+                })
+            }
+            Bootstrap::Setup(SetupState::CreatingShortcuts { rx }) => match rx.try_recv() {
+                Ok(Ok(())) => Some(Advance::ShortcutsDone),
+                Ok(Err(err)) => Some(Advance::ShortcutsFailed(err)),
+                Err(mpsc::TryRecvError::Disconnected) => Some(Advance::ShortcutsFailed(
+                    "shortcut task stopped unexpectedly".into(),
+                )),
+                Err(mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(Duration::from_millis(200));
+                    None
+                }
+            },
+            _ => None,
+        };
+        match advance {
+            Some(Advance::Downloaded(path)) => {
+                self.bootstrap = Bootstrap::Setup(start_shortcuts(path));
+            }
+            Some(Advance::DownloadFailed(err)) | Some(Advance::ShortcutsFailed(err)) => {
+                self.bootstrap = Bootstrap::Setup(SetupState::Failed(err));
+            }
+            Some(Advance::ShortcutsDone) => {
+                self.bootstrap = launch_managed_bootstrap();
+            }
+            None => {}
+        }
+        // A finished relaunch (or a failure to start) is handled in render.
+        if let Bootstrap::Relaunch = self.bootstrap {
+            self.bootstrap = launch_managed_bootstrap();
+        }
+    }
+
+    /// Render the first-run setup / relaunch screen shown instead of the app.
+    fn render_bootstrap(&mut self, ctx: &egui::Context) {
+        if !self.bootstrap_positioned {
+            self.bootstrap_positioned = true;
+            if let Some(cmd) = egui::ViewportCommand::center_on_screen(ctx) {
+                ctx.send_viewport_cmd(cmd);
+            }
+        }
+        let mut retry = false;
+        let mut continue_portable = false;
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::BACKGROUND)
+                    .inner_margin(egui::Margin::same(28)),
+            )
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    if let Some(logo) = &self.logo {
+                        ui.add(egui::Image::new(logo).max_width(64.0));
+                        ui.add_space(14.0);
+                    }
+                    match &mut self.bootstrap {
+                        Bootstrap::Setup(SetupState::Preparing {
+                            downloaded, total, ..
+                        }) => {
+                            theme::section_title_with_icon(
+                                ui,
+                                theme::icons::DOWNLOAD,
+                                "Setting up Spoon",
+                            );
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(
+                                    egui::RichText::new("Preparing the managed Spoon install…")
+                                        .color(theme::TEXT_MUTED),
+                                );
+                            });
+                            if *total > 0 {
+                                ui.add_space(12.0);
+                                let fraction = (*downloaded as f32 / *total as f32).min(1.0);
+                                ui.add(egui::ProgressBar::new(fraction).text(format!(
+                                    "{} / {}",
+                                    format_mb(*downloaded),
+                                    format_mb(*total)
+                                )));
+                            }
+                        }
+                        Bootstrap::Setup(SetupState::CreatingShortcuts { .. }) => {
+                            theme::section_title_with_icon(
+                                ui,
+                                theme::icons::CHECK,
+                                "Setting up Spoon",
+                            );
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label(
+                                    egui::RichText::new("Creating shortcuts…")
+                                        .color(theme::TEXT_MUTED),
+                                );
+                            });
+                        }
+                        Bootstrap::Setup(SetupState::Failed(msg)) => {
+                            theme::section_title_with_icon(
+                                ui,
+                                theme::icons::ROTATE,
+                                "Couldn't finish setup",
+                            );
+                            ui.add_space(8.0);
+                            egui::Frame::new()
+                                .fill(theme::ERROR.gamma_multiply(0.10))
+                                .stroke(egui::Stroke::new(
+                                    1.0_f32,
+                                    theme::ERROR.gamma_multiply(0.5),
+                                ))
+                                .corner_radius(egui::CornerRadius::same(6))
+                                .inner_margin(egui::Margin::symmetric(8, 6))
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        egui::RichText::new(msg.as_str())
+                                            .color(theme::ERROR)
+                                            .size(12.5),
+                                    );
+                                });
+                            ui.add_space(12.0);
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add(theme::primary_icon_button(theme::icons::ROTATE, "Retry"))
+                                    .clicked()
+                                {
+                                    retry = true;
+                                }
+                                if ui
+                                    .add(theme::ghost_button("Continue without installing"))
+                                    .clicked()
+                                {
+                                    continue_portable = true;
+                                }
+                            });
+                        }
+                        Bootstrap::Relaunch | Bootstrap::Done => {
+                            theme::section_title_with_icon(
+                                ui,
+                                theme::icons::ROTATE,
+                                "Launching Spoon…",
+                            );
+                        }
+                        Bootstrap::None => {}
+                    }
+                });
+            });
+        if retry {
+            self.bootstrap = Bootstrap::Setup(start_managed_setup());
+        }
+        if continue_portable {
+            self.bootstrap = Bootstrap::None;
+            // Restore the normal app window that the bootstrap screen replaced.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
+                820.0, 520.0,
+            )));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+            ctx.request_repaint();
+        }
+        if matches!(self.bootstrap, Bootstrap::Done) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
     fn refresh_metrics(&mut self, ctx: &egui::Context) {
         if self.last_metrics_refresh.elapsed() < Duration::from_secs(1) {
             return;
@@ -631,9 +957,29 @@ impl eframe::App for SpoonApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if !matches!(self.bootstrap, Bootstrap::None) {
+            self.poll_bootstrap(ctx);
+            self.render_bootstrap(ctx);
+            return;
+        }
         if self.splash.is_some() {
             self.render_splash(ctx);
             return;
+        }
+        // Closing the window with a downloaded update applies it on the way
+        // out; failure keeps the app open so the update isn't lost.
+        if !self.apply_started && ctx.input(|i| i.viewport().close_requested()) {
+            if let Some(path) = self.pending_apply_path() {
+                match swap_in_update(&path) {
+                    Ok(()) => self.apply_started = true,
+                    Err(err) => {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                        let msg = format!("Could not apply the update: {err}");
+                        self.global_error = Some(msg.clone());
+                        self.update_state = UpdateState::Failed(msg);
+                    }
+                }
+            }
         }
         self.poll_servers(ctx);
         self.poll_duplicate_task();
@@ -846,9 +1192,13 @@ impl SpoonApp {
 
                 let time = ui.ctx().input(|i| i.time);
                 // Keep room for the pinned footer buttons below the list.
-                let update_available = matches!(self.update_state, UpdateState::Available(_));
-                let footer_height = if update_available { 116.0 } else { 84.0 };
-                let list_height = (ui.available_height() - footer_height).max(72.0);
+                let update_row = match &self.update_state {
+                    UpdateState::Available(_) => true,
+                    UpdateState::Ready { .. } => updates_apply_in_place(),
+                    _ => false,
+                };
+                let list_height =
+                    (ui.available_height() - sidebar_footer_height(update_row)).max(72.0);
                 let mut select = None;
                 let mut rename = None;
                 let mut duplicate = None;
@@ -913,8 +1263,18 @@ impl SpoonApp {
                     self.confirm_remove = Some(i);
                 }
 
+                let mut restart_update = None;
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     ui.spacing_mut().item_spacing.y = 8.0;
+                    ui.add_sized(
+                        [ui.available_width(), 18.0],
+                        egui::Label::new(
+                            egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
+                                .size(11.5)
+                                .color(theme::TEXT_MUTED),
+                        )
+                        .halign(egui::Align::Center),
+                    );
                     if ui
                         .add_sized(
                             [ui.available_width(), 36.0],
@@ -946,33 +1306,49 @@ impl SpoonApp {
                     {
                         self.add_dialog = Some(AddDialog::new());
                     }
-                    if let UpdateState::Available(info) = &self.update_state {
-                        let version = info.release.version.to_string();
-                        let banner = egui::Frame::new()
-                            .fill(theme::PRIMARY.gamma_multiply(0.10))
-                            .stroke(egui::Stroke::new(
-                                1.0_f32,
-                                theme::PRIMARY.gamma_multiply(0.5),
-                            ))
-                            .corner_radius(egui::CornerRadius::same(6))
-                            .inner_margin(egui::Margin::symmetric(8, 6))
-                            .show(ui, |ui| {
-                                ui.label(theme::icon_text_job(
-                                    theme::icons::ROTATE,
-                                    &format!("Update available · v{version}"),
-                                    theme::PRIMARY,
-                                ));
-                            });
-                        if banner
-                            .response
-                            .interact(egui::Sense::click())
-                            .on_hover_cursor(egui::CursorIcon::PointingHand)
-                            .clicked()
-                        {
-                            self.update_dialog_open = true;
+                    // The update row: an available update opens the dialog; a
+                    // downloaded one restarts straight into it and stays here
+                    // ("Restart to update") even after the dialog is closed.
+                    match &self.update_state {
+                        UpdateState::Available(info) => {
+                            let version = info.release.version.to_string();
+                            if ui
+                                .add_sized(
+                                    [ui.available_width(), 36.0],
+                                    theme::warn_icon_button(
+                                        theme::icons::ROTATE,
+                                        "Update available",
+                                    ),
+                                )
+                                .on_hover_text(format!("See what's new and update to v{version}"))
+                                .clicked()
+                            {
+                                self.update_dialog_open = true;
+                            }
                         }
+                        UpdateState::Ready { path, version }
+                            if updates_apply_in_place()
+                                && ui
+                                    .add_sized(
+                                        [ui.available_width(), 36.0],
+                                        theme::warn_icon_button(
+                                            theme::icons::RESTART,
+                                            "Restart to update",
+                                        ),
+                                    )
+                                    .on_hover_text(format!(
+                                        "Restart Spoon to apply update v{version}"
+                                    ))
+                                    .clicked() =>
+                        {
+                            restart_update = Some(path.clone());
+                        }
+                        _ => {}
                     }
                 });
+                if let Some(path) = restart_update {
+                    self.apply_update_and_close(ctx, &path);
+                }
             });
     }
 
@@ -1947,16 +2323,19 @@ impl SpoonApp {
         }
     }
 
-    /// App update dialog: shows the new release, drives the download and
-    /// offers to reveal the downloaded installer.
+    /// App update dialog: shows the new release, drives the download and then
+    /// either restarts into the downloaded update (managed installs) or
+    /// reveals it in the file manager (other platforms).
     fn render_update_dialog(&mut self, ctx: &egui::Context) {
         if !self.update_dialog_open {
             return;
         }
+        let applies_in_place = updates_apply_in_place();
         let mut close = false;
         let mut download = false;
         let mut skip = false;
         let mut retry = false;
+        let mut restart: Option<PathBuf> = None;
         let mut open_folder: Option<PathBuf> = None;
         let modal = egui::Modal::new(egui::Id::new("app_update_dialog"))
             .frame(
@@ -1973,14 +2352,23 @@ impl SpoonApp {
                 ui.add_space(10.0);
                 match &mut self.update_state {
                     UpdateState::Available(info) => {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "Current: {}  →  New: {}",
-                                env!("CARGO_PKG_VERSION"),
-                                info.release.version
-                            ))
-                            .color(theme::TEXT),
-                        );
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Current: {}",
+                                    env!("CARGO_PKG_VERSION")
+                                ))
+                                .color(theme::TEXT),
+                            );
+                            ui.label(
+                                theme::icon(theme::icons::ARROW_RIGHT, 12.0)
+                                    .color(theme::TEXT_MUTED),
+                            );
+                            ui.label(
+                                egui::RichText::new(format!("New: {}", info.release.version))
+                                    .color(theme::TEXT),
+                            );
+                        });
                         ui.add_space(4.0);
                         let mut details = format!("Size: {}", format_mb(info.asset.size));
                         if let Some(published) = &info.release.published_at {
@@ -2024,13 +2412,14 @@ impl SpoonApp {
                         )));
                     }
                     UpdateState::Ready { path, version } => {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "Update v{version} saved to {}",
-                                path.display()
-                            ))
-                            .color(theme::TEXT_MUTED),
-                        );
+                        let text = if applies_in_place {
+                            format!(
+                                "Update v{version} downloaded. Restart Spoon to finish updating."
+                            )
+                        } else {
+                            format!("Update v{version} saved to {}", path.display())
+                        };
+                        ui.label(egui::RichText::new(text).color(theme::TEXT_MUTED));
                     }
                     UpdateState::Failed(msg) => {
                         egui::Frame::new()
@@ -2069,6 +2458,20 @@ impl SpoonApp {
                                 }
                                 if ui.add(theme::ghost_button("Skip this version")).clicked() {
                                     skip = true;
+                                }
+                                if ui.add(theme::ghost_button("Later")).clicked() {
+                                    close = true;
+                                }
+                            }
+                            UpdateState::Ready { path, .. } if applies_in_place => {
+                                if ui
+                                    .add(theme::primary_icon_button(
+                                        theme::icons::RESTART,
+                                        "Restart to Update",
+                                    ))
+                                    .clicked()
+                                {
+                                    restart = Some(path.clone());
                                 }
                                 if ui.add(theme::ghost_button("Later")).clicked() {
                                     close = true;
@@ -2129,11 +2532,42 @@ impl SpoonApp {
                 None => close = true,
             }
         }
+        if let Some(path) = restart {
+            self.apply_update_and_close(ctx, &path);
+        }
         if let Some(path) = open_folder {
             reveal_in_folder(&path);
         }
         if close {
             self.update_dialog_open = false;
+        }
+    }
+
+    /// Spawn the downloaded replacement, which swaps itself in for the managed
+    /// executable once this process exits, then close the window.
+    fn apply_update_and_close(&mut self, ctx: &egui::Context, downloaded: &Path) {
+        match swap_in_update(downloaded) {
+            Ok(()) => {
+                self.apply_started = true;
+                self.update_dialog_open = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Err(err) => {
+                self.update_state =
+                    UpdateState::Failed(format!("Could not apply the update: {err}"));
+            }
+        }
+    }
+
+    /// Path of the downloaded update waiting for a restart, when this install
+    /// applies updates in place.
+    fn pending_apply_path(&self) -> Option<PathBuf> {
+        if !updates_apply_in_place() {
+            return None;
+        }
+        match &self.update_state {
+            UpdateState::Ready { path, .. } => Some(path.clone()),
+            _ => None,
         }
     }
 
@@ -4908,6 +5342,38 @@ fn memory_stepper(ui: &mut egui::Ui, label: &str, value_mb: &mut u32, min: u32, 
     });
 }
 
+/// Swap a downloaded update in for the managed executable and start it. Runs
+/// entirely in this process (Windows allows renaming a running image), so it
+/// works no matter which version the downloaded binary was built from, and a
+/// failure leaves the current install untouched.
+fn swap_in_update(downloaded: &Path) -> Result<(), String> {
+    let target = bootstrap::managed_exe()
+        .ok_or_else(|| "could not determine the managed executable path".to_string())?;
+    bootstrap::apply_update_download(downloaded, &target)?;
+    bootstrap::launch(&target)
+        .map(|_| ())
+        .map_err(|err| format!("could not relaunch {}: {err}", target.display()))
+}
+
+/// Height the sidebar footer needs: full-width 36px button rows, a version
+/// label, 8px gaps, and a small margin. Must match `render_sidebar` or the
+/// server list and the pinned footer start to overlap.
+pub fn sidebar_footer_height(update_row_visible: bool) -> f32 {
+    const BUTTON_HEIGHT: f32 = 36.0;
+    const GAP: f32 = 8.0;
+    const VERSION_HEIGHT: f32 = 18.0;
+    const BOTTOM_MARGIN: f32 = 4.0;
+    let buttons = if update_row_visible { 4.0 } else { 3.0 };
+    BUTTON_HEIGHT * buttons + GAP * buttons + VERSION_HEIGHT + BOTTOM_MARGIN
+}
+
+/// Whether downloaded updates replace the running app in one restart. Only
+/// managed Windows installs do this; elsewhere the dialog reveals the
+/// downloaded file instead.
+fn updates_apply_in_place() -> bool {
+    bootstrap::is_managed_flow_enabled() && bootstrap::running_from_managed()
+}
+
 /// Opens the file's location in the system file manager.
 fn reveal_in_folder(path: &Path) {
     #[cfg(target_os = "windows")]
@@ -6049,11 +6515,26 @@ fn install_server_version(
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_directory, format_duration, update_online_players};
+    use super::{copy_directory, format_duration, sidebar_footer_height, update_online_players};
     use spoon_core::new_id;
     use std::collections::BTreeSet;
     use std::fs;
     use std::time::Duration;
+
+    #[test]
+    fn sidebar_footer_height_covers_every_button() {
+        // Three button rows normally, four when the update notice is shown;
+        // the pinned version label also needs room beneath the buttons.
+        assert_eq!(
+            sidebar_footer_height(false),
+            36.0 * 3.0 + 8.0 * 3.0 + 18.0 + 4.0
+        );
+        assert_eq!(
+            sidebar_footer_height(true),
+            36.0 * 4.0 + 8.0 * 4.0 + 18.0 + 4.0
+        );
+        assert!(sidebar_footer_height(true) > sidebar_footer_height(false));
+    }
 
     #[test]
     fn player_list_tracks_join_and_leave_console_events() {

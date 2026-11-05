@@ -2,6 +2,7 @@ mod config;
 mod process;
 
 pub mod backup;
+pub mod bootstrap;
 pub mod eula;
 pub mod files;
 pub mod highlight;

@@ -33,6 +33,27 @@ New-Item -ItemType Directory -Force $dist | Out-Null
 $exe = Join-Path $dist 'Spoon-Launcher-Windows-x86_64.exe'
 $zip = Join-Path $dist 'Spoon-Launcher-Windows-x86_64.zip'
 Copy-Item "target\$target\release\spoon-gui.exe" $exe -Force
+
+# Optional Authenticode signing: an unsigned binary has no SmartScreen or
+# Defender reputation, which is the main reason fresh Spoon builds get
+# flagged as false positives. With a code-signing certificate configured,
+# every packaged exe is signed here:
+#   $env:SPOON_SIGN_PFX           = path to the .pfx certificate file
+#   $env:SPOON_SIGN_PFX_PASSWORD  = its password (optional for password-less pfx)
+# signtool.exe ships with the Windows SDK / Visual Studio Build Tools.
+if ($env:SPOON_SIGN_PFX) {
+    Write-Host "`n=== Signing $exe ===`n"
+    $signtool = Get-Command signtool.exe -ErrorAction SilentlyContinue
+    if (-not $signtool) {
+        throw 'signtool.exe not found. Install the Windows SDK signing tools or add signtool.exe to PATH.'
+    }
+    $signArgs = @('sign', '/fd', 'sha256', '/tr', 'http://timestamp.digicert.com', '/td', 'sha256', '/f', $env:SPOON_SIGN_PFX)
+    if ($env:SPOON_SIGN_PFX_PASSWORD) {
+        $signArgs += @('/p', $env:SPOON_SIGN_PFX_PASSWORD)
+    }
+    Invoke-Checked $signtool.Source ($signArgs + $exe)
+}
+
 Compress-Archive -Path $exe -DestinationPath $zip -Force
 
 Write-Host "`n=== Done ==="

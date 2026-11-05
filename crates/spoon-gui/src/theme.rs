@@ -230,6 +230,7 @@ pub mod icons {
     pub const FILE_LINES: &str = "\u{f15c}";
     pub const PEN: &str = "\u{f304}";
     pub const ARROW_UP: &str = "\u{f062}";
+    pub const ARROW_RIGHT: &str = "\u{f061}";
     pub const ROTATE: &str = "\u{f2f1}";
     pub const FOLDER_PLUS: &str = "\u{f65e}";
     pub const FILE_CIRCLE_PLUS: &str = "\u{e4ee}";
@@ -301,6 +302,13 @@ pub fn danger_icon_button(glyph: &str, text: &str) -> egui::Button<'static> {
     egui::Button::new(icon_text_job(glyph, text, ERROR))
         .fill(ERROR.gamma_multiply(0.12))
         .stroke(Stroke::new(1.0_f32, ERROR.gamma_multiply(0.55)))
+}
+
+/// A tinted attention button with a leading icon (update available).
+pub fn warn_icon_button(glyph: &str, text: &str) -> egui::Button<'static> {
+    egui::Button::new(icon_text_job(glyph, text, WARN))
+        .fill(WARN.gamma_multiply(0.12))
+        .stroke(Stroke::new(1.0_f32, WARN.gamma_multiply(0.55)))
 }
 
 /// A rounded card container.

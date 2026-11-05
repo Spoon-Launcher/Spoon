@@ -3,7 +3,7 @@
 //! The identity band must size to its content; everything below it (RAM
 //! strip, tab bar, page content) has to stay visible in the window.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use egui_kittest::Harness;
 use spoon_gui::theme;
@@ -116,4 +116,76 @@ fn sidebar_search_clear_button_stays_inside_panel() {
         clear.right(),
         panel.right()
     );
+}
+
+/// The pinned sidebar footer (buttons and version label) must fit inside the
+/// height the server list reserves for it, or the list and footer overlap.
+#[test]
+fn sidebar_footer_fits_reserved_height() {
+    for (update_available, buttons) in [(false, 3), (true, 4)] {
+        let footer_rect = Cell::new(None);
+        let version_rect = Cell::new(None);
+        let button_rects = RefCell::new(Vec::new());
+        let fonts_ready = Cell::new(false);
+        let mut harness = Harness::new(|ctx| {
+            theme::apply(ctx);
+            if !fonts_ready.get() {
+                // set_fonts only takes effect on the next pass; skip a frame
+                // so the icon font used by the buttons is bound.
+                fonts_ready.set(true);
+                ctx.request_repaint();
+                return;
+            }
+            egui::SidePanel::left("server_list").show(ctx, |ui| {
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
+                    ui.spacing_mut().item_spacing.y = 8.0;
+                    version_rect.set(Some(
+                        ui.add_sized(
+                            [ui.available_width(), 18.0],
+                            egui::Label::new(
+                                egui::RichText::new("v0.0.1")
+                                    .size(11.5)
+                                    .color(theme::TEXT_MUTED),
+                            )
+                            .halign(egui::Align::Center),
+                        )
+                        .rect,
+                    ));
+                    let mut rects = Vec::new();
+                    for _ in 0..buttons {
+                        rects.push(
+                            ui.add_sized(
+                                [ui.available_width(), 36.0],
+                                theme::ghost_icon_button(theme::icons::GEAR, "Footer"),
+                            )
+                            .rect,
+                        );
+                    }
+                    *button_rects.borrow_mut() = rects;
+                    footer_rect.set(Some(ui.min_rect()));
+                });
+            });
+        });
+        harness.run_steps(2);
+
+        let rendered = footer_rect.get().expect("footer rendered").height();
+        let reserved = spoon_gui::app::sidebar_footer_height(update_available);
+        let version = version_rect.get().expect("version rendered");
+        let lowest_button = button_rects
+            .borrow()
+            .iter()
+            .map(|rect| rect.bottom())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            rendered <= reserved,
+            "footer with update_available={update_available} renders {rendered:.1}px \
+             but the server list only reserves {reserved:.1}px"
+        );
+        assert!(
+            version.top() > lowest_button,
+            "version label is not below the footer buttons: {:.1} <= {:.1}",
+            version.top(),
+            lowest_button
+        );
+    }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "spoon-gui"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
@@ -13,7 +13,7 @@ rfd = "0.15"
 spoon-core = { path = "../spoon-core" }
 sysinfo = "0.33"
 
-[target.'cfg(windows)'.build-dependencies]
+[build-dependencies]
 winres = "0.1"
 
 [dev-dependencies]

@@ -138,21 +138,37 @@ impl UpdateClient {
         }
     }
 
+    /// Returns whether this running build is newer than `version`.
+    pub fn current_version_is_newer_than(&self, version: &semver::Version) -> bool {
+        self.current.cmp(version).is_gt()
+    }
+
     /// Check for a release newer than the current version that ships the
     /// asset for this platform (see [`asset_name`]). Returns `Ok(None)` when
     /// up to date, when there is no (non-draft, non-prerelease) release, when
     /// its tag isn't semver, when the platform has no published asset, or
     /// when the asset is missing.
     pub fn check(&self) -> Result<Option<UpdateInfo>, UpdateError> {
+        let Some(update) = self.latest()? else {
+            return Ok(None);
+        };
+        if update.release.version <= self.current {
+            return Ok(None);
+        }
+        Ok(Some(update))
+    }
+
+    /// The newest published release that ships the asset for this platform,
+    /// regardless of whether it is newer than the running version. Used by
+    /// the first-run installer, which must fetch the managed copy even when
+    /// the running executable already is the latest release.
+    pub fn latest(&self) -> Result<Option<UpdateInfo>, UpdateError> {
         let Some(asset_name) = asset_name() else {
             return Ok(None);
         };
         let Some(release) = self.latest_release()? else {
             return Ok(None);
         };
-        if release.version <= self.current {
-            return Ok(None);
-        }
         let asset = release
             .assets
             .iter()
@@ -293,6 +309,15 @@ mod tests {
         );
         assert_eq!(asset_name_for("freebsd", "x86_64"), None);
         assert_eq!(asset_name_for("windows", "aarch64"), None);
+    }
+
+    #[test]
+    fn current_version_comparison_uses_semver_ordering() {
+        let client = UpdateClient::with_repo("owner/repo", "1.10.0");
+
+        assert!(client.current_version_is_newer_than(&semver::Version::parse("1.9.9").unwrap()));
+        assert!(!client.current_version_is_newer_than(&semver::Version::parse("1.10.0").unwrap()));
+        assert!(!client.current_version_is_newer_than(&semver::Version::parse("1.11.0").unwrap()));
     }
 
     #[test]
