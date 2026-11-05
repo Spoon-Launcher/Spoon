@@ -4654,7 +4654,7 @@ fn load_splash(ctx: &egui::Context) -> Option<Splash> {
 
 const LOGO_PNG: &[u8] = include_bytes!("../../../assets/images/Spoon-No-Border.png");
 const LOGO_HOVER_PNG: &[u8] = include_bytes!("../../../assets/images/Spoon-Hover.png");
-const DISCORD_INVITE_URL: &str = "https://discord.gg/MAWNtugAeR";
+const DISCORD_INVITE_URL: &str = "https://discord.gg/7UEZnsMMkf";
 const DISCORD_BUTTON_COLOR: egui::Color32 = egui::Color32::from_rgb(88, 101, 242);
 
 /// Window and taskbar icon.
