@@ -15,9 +15,9 @@ Join the [Discord](https://discord.gg/7UEZnsMMkf) for updates and to talk with t
 ## What you can do
 
 - **Manage server instances** — create servers with your chosen software, version, memory, and JVM
-  arguments; then rename, duplicate, import, start, stop, restart, or kill them.
+  argument.
 - **Set up server software** — choose from vanilla, Paper, Fabric, Forge, and 20+ other server
-  types, accept the EULA, and edit server settings and `server.properties` in the app.
+  types.
 - **Use a live console** — view colorized output, send commands, search and filter the console, and
   browse command history.
 - **Monitor activity** — check CPU and memory usage, uptime, online players, and the server IP.
@@ -45,9 +45,10 @@ See [FEATURES.md](./FEATURES.md) for the full feature list and development statu
   run; macOS artifacts can't be built on Linux — the Apple SDK is macOS-only).
 - **`.\scripts\build-windows.ps1` (Windows only):** a Windows host with the
   Visual Studio Build Tools.
-- Spoon itself downloads server jars and software icons from the
-  [MCJars](https://mcjars.app) API at runtime, so an internet connection is
-  needed for creating servers and fetching icons either way.
+- Spoon preloads server software versions and icons from the
+  [MCJars](https://mcjars.app) API during startup. An internet connection is
+  needed to populate that catalog and to create servers; if MCJars is
+  unavailable, Spoon continues with the UI and retries the catalog later.
 
 ### Run from source
 

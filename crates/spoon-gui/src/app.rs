@@ -33,6 +33,7 @@ const SOFTWARE_REFRESH_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const SOFTWARE_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 /// Icon textures built per frame, so a burst of finished downloads can't stall one frame.
 const MAX_ICONS_PER_FRAME: usize = 4;
+const BACKUP_STATUS_DURATION: Duration = Duration::from_secs(4);
 
 /// Result of one software icon download: the lowercase software name plus the raw PNG bytes.
 type IconFetch = (String, Result<Vec<u8>, String>);
@@ -136,6 +137,118 @@ enum ServerPage {
     Players,
     Backups,
     Settings,
+}
+
+struct ImportDialog {
+    name: String,
+    source_dir: Option<PathBuf>,
+    error: Option<String>,
+    pending: Option<Receiver<Result<ServerConfig, String>>>,
+}
+
+impl ImportDialog {
+    fn new() -> Self {
+        Self {
+            name: String::new(),
+            source_dir: None,
+            error: None,
+            pending: None,
+        }
+    }
+
+    fn is_importing(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    fn choose_folder(&mut self) {
+        let Some(folder) = rfd::FileDialog::new()
+            .set_title("Select an existing server folder")
+            .pick_folder()
+        else {
+            return;
+        };
+        match fs::canonicalize(&folder) {
+            Ok(folder) => {
+                self.source_dir = Some(folder);
+                self.error = None;
+            }
+            Err(err) => self.error = Some(format!("Could not open server folder: {err}")),
+        }
+    }
+
+    fn start_import(&mut self, servers_root: &Path) {
+        self.error = None;
+        let name = self.name.trim().to_string();
+        if name.is_empty() {
+            self.error = Some("Name is required.".to_string());
+            return;
+        }
+        let Some(source_dir) = self.source_dir.clone() else {
+            self.error = Some("Choose a server folder to import.".to_string());
+            return;
+        };
+        let jar_path = match select_server_jar(&source_dir) {
+            Ok(Some(path)) => path,
+            Ok(None) => return,
+            Err(err) => {
+                self.error = Some(err);
+                return;
+            }
+        };
+        let relative_jar = match jar_path.strip_prefix(&source_dir) {
+            Ok(path) => path.to_path_buf(),
+            Err(_) => {
+                self.error = Some(
+                    "The selected server JAR must be directly inside its server folder.".into(),
+                );
+                return;
+            }
+        };
+
+        let servers_root = servers_root.to_path_buf();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = (|| {
+                fs::create_dir_all(&servers_root)
+                    .map_err(|err| format!("Could not create Spoon server folder: {err}"))?;
+                let servers_root = fs::canonicalize(&servers_root)
+                    .map_err(|err| format!("Could not open Spoon server folder: {err}"))?;
+                let target_dir = unique_server_dir(&servers_root, &name);
+                if target_dir.starts_with(&source_dir) {
+                    return Err(
+                        "Spoon's server folder is inside the selected folder; choose a different folder."
+                            .to_string(),
+                    );
+                }
+                files::copy_directory(&source_dir, &target_dir)
+                    .map_err(|err| format!("Could not copy server folder: {err}"))?;
+                Ok(ServerConfig::new(
+                    new_id(),
+                    name,
+                    target_dir.join(relative_jar),
+                    target_dir,
+                    4096,
+                ))
+            })();
+            let _ = tx.send(result);
+        });
+        self.pending = Some(rx);
+    }
+
+    fn take_finished(&mut self) -> Option<Result<ServerConfig, String>> {
+        let rx = self.pending.as_ref()?;
+        match rx.try_recv() {
+            Ok(result) => {
+                self.pending = None;
+                Some(result)
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.pending = None;
+                Some(Err("Server folder copy stopped unexpectedly.".to_string()))
+            }
+            Err(mpsc::TryRecvError::Empty) => None,
+        }
+    }
 }
 
 pub struct ServerEntry {
@@ -311,6 +424,7 @@ pub struct SpoonApp {
     /// Sidebar search box filtering servers by name.
     sidebar_filter: String,
     add_dialog: Option<AddDialog>,
+    import_dialog: Option<ImportDialog>,
     settings_dialog: Option<SettingsDialog>,
     files_dialog: Option<FilesDialog>,
     backups_dialog: Option<BackupsDialog>,
@@ -421,6 +535,7 @@ impl SpoonApp {
             page: ServerPage::Overview,
             sidebar_filter: String::new(),
             add_dialog: None,
+            import_dialog: None,
             settings_dialog: None,
             files_dialog: None,
             backups_dialog: None,
@@ -489,8 +604,12 @@ impl SpoonApp {
         }
         self.page = page;
         match page {
-            ServerPage::Files if self.files_dialog.is_none() => {
-                self.files_dialog = Some(FilesDialog::new(&self.servers[index].config));
+            ServerPage::Files => {
+                if let Some(dialog) = &mut self.files_dialog {
+                    dialog.refresh();
+                } else {
+                    self.files_dialog = Some(FilesDialog::new(&self.servers[index].config));
+                }
             }
             ServerPage::Settings if self.settings_dialog.is_none() => {
                 self.settings_dialog = Some(SettingsDialog::new(&self.servers[index].config));
@@ -963,6 +1082,9 @@ impl eframe::App for SpoonApp {
             return;
         }
         if self.splash.is_some() {
+            self.poll_icons(ctx);
+            self.poll_software(ctx);
+            self.ensure_icons();
             self.render_splash(ctx);
             return;
         }
@@ -996,6 +1118,7 @@ impl eframe::App for SpoonApp {
         self.render_sidebar(ctx);
         self.render_main_panel(ctx);
         self.render_add_dialog(ctx);
+        self.render_import_dialog(ctx);
         self.render_remove_confirm(ctx);
         self.render_update_dialog(ctx);
         self.render_version_dialog(ctx);
@@ -1005,6 +1128,7 @@ impl eframe::App for SpoonApp {
 
 impl SpoonApp {
     fn render_splash(&mut self, ctx: &egui::Context) {
+        let preload_complete = !self.software.is_loading() && self.icon_pending.is_empty();
         let Some(splash) = &mut self.splash else {
             return;
         };
@@ -1019,7 +1143,7 @@ impl SpoonApp {
                 || i.key_pressed(egui::Key::Enter)
                 || i.key_pressed(egui::Key::Space)
         });
-        if splash.started.elapsed() >= SPLASH_DURATION || skip {
+        if preload_complete && (splash.started.elapsed() >= SPLASH_DURATION || skip) {
             self.splash = None;
             ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(true));
             ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(true));
@@ -1072,13 +1196,17 @@ impl SpoonApp {
                 if ui
                     .add_sized(
                         [ui.available_width(), 36.0],
-                        egui::Button::new(theme::icon_text_job(
-                            theme::icons::COMMENTS,
-                            "Join Discord",
-                            egui::Color32::WHITE,
-                        ))
-                        .fill(DISCORD_BUTTON_COLOR)
-                        .stroke(egui::Stroke::NONE),
+                        theme::animated_button(
+                            egui::Button::new(theme::icon_text_job(
+                                theme::icons::COMMENTS,
+                                "Join Discord",
+                                egui::Color32::WHITE,
+                            )),
+                            DISCORD_BUTTON_COLOR,
+                            DISCORD_BUTTON_COLOR.linear_multiply(1.1),
+                            egui::Stroke::NONE,
+                            egui::Stroke::NONE,
+                        ),
                     )
                     .on_hover_cursor(egui::CursorIcon::PointingHand)
                     .on_hover_text("Join the Spoon community on Discord")
@@ -1153,7 +1281,7 @@ impl SpoonApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if !self.sidebar_filter.is_empty()
                             && ui
-                                .add(egui::Button::new(egui::RichText::new("✕").size(12.0)))
+                                .add(egui::Button::new(theme::icon(theme::icons::XMARK, 12.0)))
                                 .on_hover_text("Clear search")
                                 .clicked()
                         {
@@ -1161,6 +1289,7 @@ impl SpoonApp {
                         }
                         ui.add(
                             egui::TextEdit::singleline(&mut self.sidebar_filter)
+                                .id(egui::Id::new("sidebar_server_filter"))
                                 .desired_width(f32::INFINITY)
                                 .hint_text("Search servers…"),
                         );
@@ -1203,13 +1332,14 @@ impl SpoonApp {
                 let mut rename = None;
                 let mut duplicate = None;
                 let mut remove = None;
+                let mut open_folder = None;
                 let filter = self.sidebar_filter.trim().to_lowercase();
                 egui::ScrollArea::vertical()
                     .id_salt("server_list_scroll")
                     .auto_shrink([false, false])
                     .max_height(list_height)
                     .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.y = 4.0;
+                        ui.spacing_mut().item_spacing.y = 10.0;
                         let mut matched = 0usize;
                         for i in 0..self.servers.len() {
                             if !filter.is_empty()
@@ -1236,6 +1366,7 @@ impl SpoonApp {
                                 Some(ServerAction::Settings) => rename = Some(i),
                                 Some(ServerAction::Duplicate) => duplicate = Some(i),
                                 Some(ServerAction::Remove) => remove = Some(i),
+                                Some(ServerAction::OpenFolder) => open_folder = Some(i),
                                 None => {}
                             }
                         }
@@ -1261,6 +1392,9 @@ impl SpoonApp {
                 }
                 if let Some(i) = remove {
                     self.confirm_remove = Some(i);
+                }
+                if let Some(i) = open_folder {
+                    open_directory(&self.servers[i].config.working_dir);
                 }
 
                 let mut restart_update = None;
@@ -1532,7 +1666,7 @@ impl SpoonApp {
                                 .on_hover_text("Reveal the server folder in the file manager")
                                 .clicked()
                             {
-                                reveal_in_folder(&entry.config.working_dir);
+                                open_directory(&entry.config.working_dir);
                             }
                         });
                     });
@@ -1791,12 +1925,8 @@ impl SpoonApp {
                         .color(theme::TEXT_MUTED),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let copy = egui::Button::new(
-                        theme::icon(theme::icons::COPY, 14.0).color(theme::TEXT_MUTED),
-                    )
-                    .frame(false);
                     if ui
-                        .add(copy)
+                        .add(icon_toolbar_button(theme::icons::COPY))
                         .on_hover_text("Copy address for players on your network")
                         .clicked()
                     {
@@ -2207,6 +2337,151 @@ impl SpoonApp {
 
         if cancel {
             self.add_dialog = None;
+        }
+    }
+
+    fn render_import_dialog(&mut self, ctx: &egui::Context) {
+        if self.import_dialog.is_none() {
+            return;
+        }
+        let mut cancel = false;
+        let mut choose_folder = false;
+        let mut import_clicked = false;
+        let modal = egui::Modal::new(egui::Id::new("import_server_dialog"))
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::SURFACE)
+                    .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
+                    .corner_radius(egui::CornerRadius::same(12))
+                    .inner_margin(egui::Margin::same(20)),
+            )
+            .backdrop_color(egui::Color32::from_black_alpha(140))
+            .show(ctx, |ui| {
+                ui.set_width(460.0);
+                ui.label(theme::title_with_icon(
+                    theme::icons::FOLDER_OPEN,
+                    "Import Existing Server",
+                    theme::PRIMARY,
+                ));
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new("Choose a name and folder to copy into Spoon.")
+                        .size(13.0)
+                        .color(theme::TEXT_MUTED),
+                );
+                ui.add_space(14.0);
+                let dialog = self.import_dialog.as_mut().unwrap();
+                ui.label(
+                    egui::RichText::new("Name")
+                        .size(12.0)
+                        .color(theme::TEXT_MUTED),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut dialog.name)
+                        .hint_text("Server name")
+                        .desired_width(f32::INFINITY),
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(theme::ghost_icon_button(
+                            theme::icons::FOLDER_OPEN,
+                            "Choose Folder",
+                        ))
+                        .clicked()
+                    {
+                        choose_folder = true;
+                    }
+                    match &dialog.source_dir {
+                        Some(folder) => {
+                            let name = folder
+                                .file_name()
+                                .unwrap_or(folder.as_os_str())
+                                .to_string_lossy();
+                            ui.label(egui::RichText::new(name.as_ref()).color(theme::TEXT_MUTED))
+                                .on_hover_text(folder.display().to_string());
+                        }
+                        None => {
+                            ui.label(
+                                egui::RichText::new("No folder selected").color(theme::TEXT_MUTED),
+                            );
+                        }
+                    }
+                });
+                if let Some(err) = &dialog.error {
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new(err).color(theme::ERROR));
+                }
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let importing = dialog.is_importing();
+                        if importing {
+                            ui.add_enabled(false, theme::primary_button("  Importing…  "));
+                        } else if ui
+                            .add(theme::primary_icon_button(theme::icons::CHECK, "Import"))
+                            .clicked()
+                        {
+                            import_clicked = true;
+                        }
+                        if ui
+                            .add_enabled(
+                                !importing,
+                                theme::ghost_icon_button(theme::icons::XMARK, "Cancel"),
+                            )
+                            .clicked()
+                        {
+                            cancel = true;
+                        }
+                    });
+                });
+            });
+
+        let importing = self
+            .import_dialog
+            .as_ref()
+            .is_some_and(ImportDialog::is_importing);
+        if modal.should_close() && !importing {
+            self.import_dialog = None;
+        }
+        if importing {
+            ctx.request_repaint_after(Duration::from_millis(200));
+        }
+
+        if choose_folder {
+            self.import_dialog.as_mut().unwrap().choose_folder();
+        }
+        if import_clicked {
+            let servers_root = self.store.servers_dir();
+            self.import_dialog
+                .as_mut()
+                .unwrap()
+                .start_import(&servers_root);
+        }
+
+        let finished = self
+            .import_dialog
+            .as_mut()
+            .and_then(ImportDialog::take_finished);
+        if let Some(result) = finished {
+            match result {
+                Ok(config) => {
+                    self.servers.push(ServerEntry::new(config));
+                    self.select_server(self.servers.len() - 1);
+                    self.save();
+                    self.import_dialog = None;
+                    self.global_error = None;
+                }
+                Err(err) => {
+                    if let Some(dialog) = &mut self.import_dialog {
+                        dialog.error = Some(err);
+                    }
+                }
+            }
+        }
+
+        if cancel {
+            self.import_dialog = None;
         }
     }
 
@@ -3356,6 +3631,8 @@ impl SpoonApp {
     fn render_files_page(&mut self, ui: &mut egui::Ui, index: usize) {
         let server_index = index;
         let server_id = self.servers[server_index].config.id.clone();
+        let server_dir = self.servers[server_index].config.working_dir.clone();
+        let server_name = self.servers[server_index].config.name.clone();
         // Recreate the page state if it belongs to a different server.
         let stale = self
             .files_dialog
@@ -3365,7 +3642,6 @@ impl SpoonApp {
         if stale {
             self.files_dialog = Some(FilesDialog::new(&self.servers[server_index].config));
         }
-        let running = self.servers[server_index].state() != ServerState::Stopped;
         let mut close = false;
         let mut save_file = false;
         let mut should_save = false;
@@ -3376,24 +3652,50 @@ impl SpoonApp {
             theme::PRIMARY,
         ));
         ui.add_space(2.0);
-        let relative = {
+        let breadcrumbs = {
             let dialog = self.files_dialog.as_ref().unwrap();
-            dialog
-                .current
-                .strip_prefix(&dialog.root)
-                .ok()
-                .filter(|rel| !rel.as_os_str().is_empty())
-                .map(|rel| rel.display().to_string())
-                .unwrap_or_else(|| ".".to_string())
+            file_path_breadcrumbs(&dialog.root, &dialog.current, &server_name)
         };
-        ui.label(
-            egui::RichText::new(format!(
-                "{} — {relative}",
-                self.servers[server_index].config.name
-            ))
-            .size(13.0)
-            .color(theme::TEXT_MUTED),
-        );
+        let mut breadcrumb_target = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            ui.spacing_mut().button_padding = egui::vec2(2.0, 0.0);
+            ui.label(egui::RichText::new("/").size(13.0).color(theme::TEXT_MUTED));
+            for (index, (path, name)) in breadcrumbs.iter().enumerate() {
+                if index > 0 {
+                    ui.label(egui::RichText::new("/").size(13.0).color(theme::TEXT_MUTED));
+                }
+                if index + 1 == breadcrumbs.len() {
+                    ui.label(
+                        egui::RichText::new(name)
+                            .size(13.0)
+                            .color(theme::TEXT_MUTED),
+                    );
+                } else {
+                    let button = theme::animated_button(
+                        egui::Button::new(
+                            egui::RichText::new(name.as_str())
+                                .size(13.0)
+                                .color(theme::TEXT),
+                        ),
+                        egui::Color32::TRANSPARENT,
+                        theme::SURFACE_HOVER,
+                        egui::Stroke::NONE,
+                        egui::Stroke::NONE,
+                    );
+                    if ui
+                        .add(button)
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .clicked()
+                    {
+                        breadcrumb_target = Some(path.clone());
+                    }
+                }
+            }
+        });
+        if let Some(target) = breadcrumb_target {
+            self.files_dialog.as_mut().unwrap().navigate_to(&target);
+        }
         ui.add_space(14.0);
         // Both panes take the height left above the footer.
         let body_height = (ui.available_height() - 54.0).max(240.0);
@@ -3405,16 +3707,6 @@ impl SpoonApp {
                 let dialog = self.files_dialog.as_mut().unwrap();
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
-                    let at_root = dialog.current == dialog.root;
-                    if ui
-                        .add_enabled(!at_root, icon_toolbar_button(theme::icons::ARROW_UP))
-                        .on_hover_text("Go up")
-                        .clicked()
-                    {
-                        if let Some(parent) = dialog.current.parent().map(Path::to_path_buf) {
-                            dialog.navigate_to(&parent);
-                        }
-                    }
                     if ui
                         .add(icon_toolbar_button(theme::icons::ROTATE))
                         .on_hover_text("Refresh")
@@ -3422,55 +3714,60 @@ impl SpoonApp {
                     {
                         dialog.refresh();
                     }
-                    ui.add_enabled_ui(!running, |ui| {
-                        if ui
-                            .add(icon_toolbar_button(theme::icons::FILE_CIRCLE_PLUS))
-                            .on_hover_text("New file")
-                            .clicked()
-                        {
-                            dialog.pending = Some(PendingFileOp::NewFile);
-                            dialog.pending_name.clear();
+                    if ui
+                        .add(icon_toolbar_button(theme::icons::FOLDER_OPEN))
+                        .on_hover_text("Open server folder")
+                        .clicked()
+                    {
+                        open_directory(&server_dir);
+                    }
+                    if ui
+                        .add(icon_toolbar_button(theme::icons::FILE_CIRCLE_PLUS))
+                        .on_hover_text("New file")
+                        .clicked()
+                    {
+                        dialog.pending = Some(PendingFileOp::NewFile);
+                        dialog.pending_name.clear();
+                        dialog.confirm_delete = None;
+                    }
+                    if ui
+                        .add(icon_toolbar_button(theme::icons::FOLDER_PLUS))
+                        .on_hover_text("New folder")
+                        .clicked()
+                    {
+                        dialog.pending = Some(PendingFileOp::NewFolder);
+                        dialog.pending_name.clear();
+                        dialog.confirm_delete = None;
+                    }
+                    let has_selection = dialog.selected.is_some();
+                    if ui
+                        .add_enabled(has_selection, icon_toolbar_button(theme::icons::PEN))
+                        .on_hover_text("Rename")
+                        .clicked()
+                    {
+                        if let Some(path) = dialog.selected.clone() {
+                            dialog.pending_name = path
+                                .file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            dialog.pending = Some(PendingFileOp::Rename(path));
                             dialog.confirm_delete = None;
                         }
-                        if ui
-                            .add(icon_toolbar_button(theme::icons::FOLDER_PLUS))
-                            .on_hover_text("New folder")
-                            .clicked()
-                        {
-                            dialog.pending = Some(PendingFileOp::NewFolder);
-                            dialog.pending_name.clear();
-                            dialog.confirm_delete = None;
-                        }
-                        let has_selection = dialog.selected.is_some();
-                        if ui
-                            .add_enabled(has_selection, icon_toolbar_button(theme::icons::PEN))
-                            .on_hover_text("Rename")
-                            .clicked()
-                        {
-                            if let Some(path) = dialog.selected.clone() {
-                                dialog.pending_name = path
-                                    .file_name()
-                                    .map(|name| name.to_string_lossy().into_owned())
-                                    .unwrap_or_default();
-                                dialog.pending = Some(PendingFileOp::Rename(path));
-                                dialog.confirm_delete = None;
-                            }
-                        }
-                        let can_delete = has_selection || !dialog.checked.is_empty();
-                        if ui
-                            .add_enabled(can_delete, icon_toolbar_button(theme::icons::TRASH))
-                            .on_hover_text("Delete")
-                            .clicked()
-                        {
-                            let targets: Vec<PathBuf> = if dialog.checked.is_empty() {
-                                dialog.selected.iter().cloned().collect()
-                            } else {
-                                dialog.checked.iter().cloned().collect()
-                            };
-                            dialog.confirm_delete = Some(targets);
-                            dialog.pending = None;
-                        }
-                    });
+                    }
+                    let can_delete = has_selection || !dialog.checked.is_empty();
+                    if ui
+                        .add_enabled(can_delete, icon_toolbar_button(theme::icons::TRASH))
+                        .on_hover_text("Delete")
+                        .clicked()
+                    {
+                        let targets: Vec<PathBuf> = if dialog.checked.is_empty() {
+                            dialog.selected.iter().cloned().collect()
+                        } else {
+                            dialog.checked.iter().cloned().collect()
+                        };
+                        dialog.confirm_delete = Some(targets);
+                        dialog.pending = None;
+                    }
                 });
                 dialog.poll_compress();
                 if dialog.compress_task.is_some() {
@@ -3585,16 +3882,6 @@ impl SpoonApp {
                     });
                 }
                 ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    ui.label(theme::icon(theme::icons::FOLDER, 12.0).color(theme::TEXT_MUTED));
-                    ui.label(
-                        egui::RichText::new(relative)
-                            .size(12.0)
-                            .color(theme::TEXT_MUTED),
-                    );
-                });
-                ui.add_space(2.0);
                 if !dialog.entries.is_empty() {
                     let all_checked = dialog
                         .entries
@@ -3696,12 +3983,6 @@ impl SpoonApp {
                     if let Some(note) = &open.note {
                         ui.label(egui::RichText::new(note).color(theme::TEXT_MUTED));
                     }
-                    if running && !open.read_only {
-                        ui.label(
-                            egui::RichText::new("Stop the server to edit files.")
-                                .color(theme::TEXT_MUTED),
-                        );
-                    }
                     ui.add_space(4.0);
                     if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
                         if let Some(search) = &mut open.search {
@@ -3781,7 +4062,7 @@ impl SpoonApp {
                         ui.add_space(4.0);
                     }
                     let current = open.search.as_ref().map(|search| search.current);
-                    ui.add_enabled_ui(!running && !open.read_only, |ui| {
+                    ui.add_enabled_ui(!open.read_only, |ui| {
                         let height = ui.available_height().max(120.0);
                         // Highlight known formats; very large files stay plain
                         // to keep typing responsive.
@@ -3848,10 +4129,9 @@ impl SpoonApp {
                             dialog.confirm_close = false;
                         }
                     } else {
-                        let can_save = !running
-                            && dialog.open.as_ref().is_some_and(|open| {
-                                !open.read_only && open.content != open.saved_content
-                            });
+                        let can_save = dialog.open.as_ref().is_some_and(|open| {
+                            !open.read_only && open.content != open.saved_content
+                        });
                         if ui
                             .add_enabled(
                                 can_save,
@@ -3949,6 +4229,7 @@ impl SpoonApp {
             // The server folder changed; re-read state Spoon caches from its files.
             self.servers[server_index].max_players = read_max_players(&dialog.working_dir);
         }
+        dialog.poll_status(ui.ctx());
         let running = self.servers[server_index].state() != ServerState::Stopped;
         let busy = dialog.busy();
         let mut create = false;
@@ -4282,7 +4563,7 @@ impl SpoonApp {
                 if !jar_source.is_file() {
                     return Err(format!("Server jar not found: {}", jar_source.display()));
                 }
-                copy_directory(&source_dir, &target_dir).map_err(|err| err.to_string())?;
+                files::copy_directory(&source_dir, &target_dir).map_err(|err| err.to_string())?;
                 if !jar_source.starts_with(&source_dir) {
                     fs::copy(&jar_source, &duplicate.jar_path)
                         .map_err(|err| format!("Could not copy server jar: {err}"))?;
@@ -4308,26 +4589,7 @@ impl SpoonApp {
     }
 
     fn import_server_folder(&mut self) {
-        let result = import_server_folder();
-        match result {
-            Ok(Some(config)) => {
-                let imported_dir = &config.working_dir;
-                let already_imported = self.servers.iter().any(|entry| {
-                    fs::canonicalize(&entry.config.working_dir)
-                        .is_ok_and(|path| path == *imported_dir)
-                });
-                if already_imported {
-                    self.global_error = Some("That server folder is already imported.".into());
-                    return;
-                }
-                self.servers.push(ServerEntry::new(config));
-                self.select_server(self.servers.len() - 1);
-                self.global_error = None;
-                self.save();
-            }
-            Ok(None) => {}
-            Err(err) => self.global_error = Some(err),
-        }
+        self.import_dialog = Some(ImportDialog::new());
     }
 }
 
@@ -4744,6 +5006,7 @@ fn load_icon_texture(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ServerAction {
     Settings,
+    OpenFolder,
     Duplicate,
     Remove,
 }
@@ -4769,10 +5032,14 @@ impl SpoonApp {
         if ui.is_rect_visible(rect) {
             let fill = if selected {
                 theme::PRIMARY.gamma_multiply(0.16)
-            } else if response.hovered() {
-                theme::SURFACE_HOVER
             } else {
-                egui::Color32::TRANSPARENT
+                theme::animated_hover_fill(
+                    ui,
+                    response.id.with("hover_fill"),
+                    response.hovered(),
+                    egui::Color32::TRANSPARENT,
+                    theme::SURFACE_HOVER,
+                )
             };
             let painter = ui.painter();
             painter.rect_filled(rect, 8.0, fill);
@@ -4885,6 +5152,17 @@ impl SpoonApp {
         let entry = &self.servers[index];
         let editable = self.duplicate_source.as_deref() != Some(entry.config.id.as_str());
         let mut action = None;
+        if ui
+            .button(theme::icon_text_job(
+                theme::icons::FOLDER_OPEN,
+                "Open Folder",
+                theme::TEXT,
+            ))
+            .clicked()
+        {
+            action = Some(ServerAction::OpenFolder);
+            ui.close_menu();
+        }
         if ui
             .add_enabled(
                 editable,
@@ -5051,10 +5329,14 @@ fn version_row(ui: &mut egui::Ui, version: &str, selected: bool, is_latest: bool
         let painter = ui.painter();
         let fill = if selected {
             theme::PRIMARY.gamma_multiply(0.14)
-        } else if response.hovered() {
-            theme::SURFACE_HOVER
         } else {
-            egui::Color32::TRANSPARENT
+            theme::animated_hover_fill(
+                ui,
+                response.id.with("hover_fill"),
+                response.hovered(),
+                egui::Color32::TRANSPARENT,
+                theme::SURFACE_HOVER,
+            )
         };
         painter.rect_filled(rect, 6.0, fill);
         if selected {
@@ -5149,10 +5431,14 @@ fn software_row(
         let painter = ui.painter();
         let fill = if selected {
             theme::PRIMARY.gamma_multiply(0.14)
-        } else if response.hovered() {
-            theme::SURFACE_HOVER
         } else {
-            egui::Color32::TRANSPARENT
+            theme::animated_hover_fill(
+                ui,
+                response.id.with("hover_fill"),
+                response.hovered(),
+                egui::Color32::TRANSPARENT,
+                theme::SURFACE_HOVER,
+            )
         };
         painter.rect_filled(rect, 6.0, fill);
         if selected {
@@ -5283,11 +5569,14 @@ fn truncate_to_width(ui: &egui::Ui, text: &str, font_id: egui::FontId, max_width
 }
 
 /// A compact square icon-only button for file-browser toolbars.
-fn icon_toolbar_button(glyph: &str) -> egui::Button<'static> {
-    egui::Button::new(theme::icon(glyph, 14.0))
-        .min_size(egui::vec2(32.0, 30.0))
-        .fill(egui::Color32::TRANSPARENT)
-        .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
+fn icon_toolbar_button(glyph: &str) -> theme::AnimatedButton {
+    theme::animated_button(
+        egui::Button::new(theme::icon(glyph, 14.0)).min_size(egui::vec2(32.0, 30.0)),
+        egui::Color32::TRANSPARENT,
+        theme::SURFACE_HOVER,
+        egui::Stroke::new(1.0_f32, theme::BORDER),
+        egui::Stroke::new(1.0_f32, theme::PRIMARY.gamma_multiply(0.6)),
+    )
 }
 
 fn state_color(state: ServerState) -> egui::Color32 {
@@ -5389,6 +5678,16 @@ fn reveal_in_folder(path: &Path) {
         .arg("-R")
         .arg(path)
         .spawn();
+}
+
+/// Opens a directory directly in the system file manager.
+fn open_directory(path: &Path) {
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("explorer").arg(path).spawn();
+    #[cfg(target_os = "linux")]
+    let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open").arg(path).spawn();
 }
 
 fn format_duration(duration: Duration) -> String {
@@ -5736,6 +6035,19 @@ impl FilesDialog {
     }
 }
 
+fn file_path_breadcrumbs(root: &Path, current: &Path, root_label: &str) -> Vec<(PathBuf, String)> {
+    let mut breadcrumbs = vec![(root.to_path_buf(), root_label.to_string())];
+    let Ok(relative) = current.strip_prefix(root) else {
+        return breadcrumbs;
+    };
+    let mut path = root.to_path_buf();
+    for name in relative.iter() {
+        path.push(name);
+        breadcrumbs.push((path.clone(), name.to_string_lossy().into_owned()));
+    }
+    breadcrumbs
+}
+
 /// Backups page state for one server instance. The heavy zipping runs on a
 /// background thread so the UI never blocks.
 struct BackupsDialog {
@@ -5753,6 +6065,7 @@ struct BackupsDialog {
     confirm_restore: Option<String>,
     error: Option<String>,
     status: Option<String>,
+    status_expires: Option<Instant>,
 }
 
 impl BackupsDialog {
@@ -5769,6 +6082,7 @@ impl BackupsDialog {
             confirm_restore: None,
             error: None,
             status: None,
+            status_expires: None,
         };
         dialog.refresh();
         dialog
@@ -5789,6 +6103,7 @@ impl BackupsDialog {
         }
         self.error = None;
         self.status = None;
+        self.status_expires = None;
         let store = self.store.clone();
         let server_id = self.server_id.clone();
         let server_name = self.server_name.clone();
@@ -5809,6 +6124,7 @@ impl BackupsDialog {
         }
         self.error = None;
         self.status = None;
+        self.status_expires = None;
         let store = self.store.clone();
         let server_id = self.server_id.clone();
         let name = name.to_string();
@@ -5831,7 +6147,7 @@ impl BackupsDialog {
             match rx.try_recv() {
                 Ok(Ok(backup)) => {
                     self.create_task = None;
-                    self.status = Some(format!("Created {}", backup.name));
+                    self.set_status(format!("Created {}", backup.name));
                     self.refresh();
                 }
                 Ok(Err(err)) => {
@@ -5850,7 +6166,7 @@ impl BackupsDialog {
             match rx.try_recv() {
                 Ok(Ok(name)) => {
                     self.restore_task = None;
-                    self.status = Some(format!("Restored {name}"));
+                    self.set_status(format!("Restored {name}"));
                     restored = true;
                 }
                 Ok(Err(err)) => {
@@ -5865,6 +6181,24 @@ impl BackupsDialog {
             }
         }
         restored
+    }
+
+    fn set_status(&mut self, status: String) {
+        self.status = Some(status);
+        self.status_expires = Some(Instant::now() + BACKUP_STATUS_DURATION);
+    }
+
+    fn poll_status(&mut self, ctx: &egui::Context) {
+        let Some(expires) = self.status_expires else {
+            return;
+        };
+        match expires.checked_duration_since(Instant::now()) {
+            Some(remaining) => ctx.request_repaint_after(remaining),
+            None => {
+                self.status = None;
+                self.status_expires = None;
+            }
+        }
     }
 
     fn delete_backup(&mut self, name: &str) {
@@ -6296,18 +6630,10 @@ fn download_and_install(
         .map_err(|err| err.to_string())
 }
 
-fn import_server_folder() -> Result<Option<ServerConfig>, String> {
-    let Some(folder) = rfd::FileDialog::new()
-        .set_title("Select an existing server folder")
-        .pick_folder()
-    else {
-        return Ok(None);
-    };
-    let folder =
-        fs::canonicalize(&folder).map_err(|err| format!("Could not open server folder: {err}"))?;
+fn select_server_jar(folder: &Path) -> Result<Option<PathBuf>, String> {
     let mut jars = Vec::new();
     for entry in
-        fs::read_dir(&folder).map_err(|err| format!("Could not read server folder: {err}"))?
+        fs::read_dir(folder).map_err(|err| format!("Could not read server folder: {err}"))?
     {
         let entry = entry.map_err(|err| format!("Could not inspect server folder: {err}"))?;
         let path = entry.path();
@@ -6330,7 +6656,7 @@ fn import_server_folder() -> Result<Option<ServerConfig>, String> {
     } else {
         let Some(jar) = rfd::FileDialog::new()
             .set_title("Select the server JAR")
-            .set_directory(&folder)
+            .set_directory(folder)
             .add_filter("Java archive", &["jar"])
             .pick_file()
         else {
@@ -6340,76 +6666,10 @@ fn import_server_folder() -> Result<Option<ServerConfig>, String> {
     };
     let jar_path =
         fs::canonicalize(&jar_path).map_err(|err| format!("Could not open server JAR: {err}"))?;
-    if jar_path.parent() != Some(folder.as_path()) {
+    if jar_path.parent() != Some(folder) {
         return Err("The selected server JAR must be directly inside its server folder.".into());
     }
-    let name = folder
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.trim().is_empty())
-        .ok_or_else(|| "Could not determine a server name from that folder.".to_string())?
-        .to_string();
-    Ok(Some(ServerConfig::new(
-        new_id(),
-        name,
-        jar_path,
-        folder,
-        4096,
-    )))
-}
-
-fn copy_directory(source: &Path, target: &Path) -> std::io::Result<()> {
-    if !source.is_dir() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("server folder does not exist: {}", source.display()),
-        ));
-    }
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::create_dir(target)?;
-    copy_directory_contents(source, target, false)
-}
-
-fn copy_directory_contents(
-    source: &Path,
-    target: &Path,
-    skip_root_server_jar: bool,
-) -> std::io::Result<()> {
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
-        let source_path = entry.path();
-        let target_path = target.join(entry.file_name());
-        let file_type = entry.file_type()?;
-        if file_type.is_symlink() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "server folder contains a symbolic link: {}",
-                    source_path.display()
-                ),
-            ));
-        }
-        if skip_root_server_jar && entry.file_name() == "server.jar" {
-            continue;
-        }
-        if file_type.is_dir() {
-            fs::create_dir_all(&target_path)?;
-            copy_directory_contents(&source_path, &target_path, false)?;
-        } else if file_type.is_file() {
-            fs::copy(&source_path, &target_path)?;
-        } else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "unsupported file in server folder: {}",
-                    source_path.display()
-                ),
-            ));
-        }
-    }
-    Ok(())
+    Ok(Some(jar_path))
 }
 
 fn install_server_version(
@@ -6437,7 +6697,7 @@ fn install_server_version(
 
         fs::create_dir_all(&config.working_dir)
             .map_err(|err| format!("Could not access server folder: {err}"))?;
-        copy_directory_contents(&staging_dir, &config.working_dir, true)
+        files::copy_directory_contents(&staging_dir, &config.working_dir, true)
             .map_err(|err| format!("Could not install server files: {err}"))?;
 
         let target = &config.jar_path;
@@ -6515,11 +6775,45 @@ fn install_server_version(
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_directory, format_duration, sidebar_footer_height, update_online_players};
-    use spoon_core::new_id;
+    use super::{
+        file_path_breadcrumbs, format_duration, sidebar_footer_height, update_online_players,
+    };
     use std::collections::BTreeSet;
-    use std::fs;
+    use std::path::Path;
     use std::time::Duration;
+
+    #[test]
+    fn file_breadcrumbs_include_only_server_folder_ancestors() {
+        let root = Path::new("server");
+        let current = root.join("world").join("players");
+        let breadcrumbs = file_path_breadcrumbs(root, &current, "Survival");
+
+        assert_eq!(
+            breadcrumbs
+                .iter()
+                .map(|(_, name)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["Survival", "world", "players"]
+        );
+        assert_eq!(
+            breadcrumbs
+                .iter()
+                .map(|(path, _)| path.clone())
+                .collect::<Vec<_>>(),
+            vec![root.to_path_buf(), root.join("world"), current]
+        );
+    }
+
+    #[test]
+    fn file_breadcrumbs_do_not_expose_paths_outside_server_root() {
+        let root = Path::new("server");
+        let breadcrumbs = file_path_breadcrumbs(root, Path::new("outside/world"), "Survival");
+
+        assert_eq!(
+            breadcrumbs,
+            vec![(root.to_path_buf(), "Survival".to_string())]
+        );
+    }
 
     #[test]
     fn sidebar_footer_height_covers_every_button() {
@@ -6552,24 +6846,5 @@ mod tests {
         assert_eq!(format_duration(Duration::from_secs(7)), "7s");
         assert_eq!(format_duration(Duration::from_secs(125)), "2m 05s");
         assert_eq!(format_duration(Duration::from_secs(3_723)), "1h 02m 03s");
-    }
-
-    #[test]
-    fn duplicate_copy_includes_nested_world_and_server_files() {
-        let root = std::env::temp_dir().join(format!("spoon-test-{}", new_id()));
-        let source = root.join("source");
-        let target = root.join("copy");
-        fs::create_dir_all(source.join("world")).unwrap();
-        fs::write(source.join("server.jar"), b"jar").unwrap();
-        fs::write(source.join("world").join("level.dat"), b"world").unwrap();
-
-        copy_directory(&source, &target).unwrap();
-
-        assert_eq!(fs::read(target.join("server.jar")).unwrap(), b"jar");
-        assert_eq!(
-            fs::read(target.join("world").join("level.dat")).unwrap(),
-            b"world"
-        );
-        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -88,7 +88,7 @@ fn identity_band_sizes_to_content() {
 fn sidebar_search_clear_button_stays_inside_panel() {
     let clear_rect = Cell::new(None);
     let panel_rect = Cell::new(None);
-    let mut filter = String::from("P");
+    let filter = RefCell::new(String::new());
     let mut harness = Harness::new(|ctx| {
         theme::apply(ctx);
         egui::SidePanel::left("server_list")
@@ -98,14 +98,24 @@ fn sidebar_search_clear_button_stays_inside_panel() {
                 ui.horizontal(|ui| {
                     ui.label("S");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        clear_rect.set(Some(ui.add(egui::Button::new("x")).rect));
+                        let mut filter = filter.borrow_mut();
+                        if !filter.is_empty() {
+                            clear_rect.set(Some(
+                                ui.add(egui::Button::new(theme::icon(theme::icons::XMARK, 12.0)))
+                                    .rect,
+                            ));
+                        }
                         ui.add(
-                            egui::TextEdit::singleline(&mut filter).desired_width(f32::INFINITY),
+                            egui::TextEdit::singleline(&mut *filter)
+                                .id(egui::Id::new("sidebar_search_filter_test"))
+                                .desired_width(f32::INFINITY),
                         );
                     });
                 });
             });
     });
+    harness.run();
+    *filter.borrow_mut() = String::from("P");
     harness.run();
 
     let clear = clear_rect.get().expect("clear button rendered");
@@ -116,6 +126,56 @@ fn sidebar_search_clear_button_stays_inside_panel() {
         clear.right(),
         panel.right()
     );
+}
+
+#[test]
+fn sidebar_search_keeps_focus_when_clear_button_appears() {
+    let search_id = egui::Id::new("sidebar_search_focus_test");
+    let filter = RefCell::new(String::new());
+    let has_focus = Cell::new(false);
+    let clear_rect = Cell::new(None);
+    let mut harness = Harness::new(|ctx| {
+        theme::apply(ctx);
+        egui::SidePanel::left("server_list")
+            .exact_width(230.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("S");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let mut filter = filter.borrow_mut();
+                        if !filter.is_empty() {
+                            clear_rect.set(Some(
+                                ui.add(egui::Button::new(theme::icon(theme::icons::XMARK, 12.0)))
+                                    .rect,
+                            ));
+                        }
+                        has_focus.set(
+                            ui.add(
+                                egui::TextEdit::singleline(&mut *filter)
+                                    .id(search_id)
+                                    .desired_width(f32::INFINITY),
+                            )
+                            .has_focus(),
+                        );
+                    });
+                });
+            });
+    });
+
+    harness
+        .ctx
+        .memory_mut(|memory| memory.request_focus(search_id));
+    harness.run();
+    harness
+        .input_mut()
+        .events
+        .push(egui::Event::Text("S".to_string()));
+    harness.step();
+    harness.step();
+
+    assert_eq!(&*filter.borrow(), "S");
+    assert!(clear_rect.get().is_some(), "clear button should appear");
+    assert!(has_focus.get(), "search field should keep keyboard focus");
 }
 
 /// The pinned sidebar footer (buttons and version label) must fit inside the

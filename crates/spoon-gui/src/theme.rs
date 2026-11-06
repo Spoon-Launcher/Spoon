@@ -6,6 +6,7 @@ pub const SURFACE_HOVER: Color32 = Color32::from_rgb(0x30, 0x39, 0x35);
 pub const SURFACE_ACTIVE: Color32 = Color32::from_rgb(0x38, 0x43, 0x3E);
 pub const CONSOLE_BG: Color32 = Color32::from_rgb(0x10, 0x14, 0x13);
 pub const PRIMARY: Color32 = Color32::from_rgb(0x8F, 0xE3, 0xB0);
+const PRIMARY_HOVER: Color32 = Color32::from_rgb(0xA6, 0xED, 0xC0);
 pub const TEXT: Color32 = Color32::from_rgb(0xF1, 0xF5, 0xF0);
 pub const TEXT_MUTED: Color32 = Color32::from_rgb(0x9A, 0xA5, 0x9E);
 pub const WARN: Color32 = Color32::from_rgb(0xE3, 0xCF, 0x8F);
@@ -150,32 +151,106 @@ pub fn apply(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
+/// A button whose visual colors transition between idle, hover and active states.
+pub struct AnimatedButton {
+    button: egui::Button<'static>,
+    fills: [Color32; 4],
+    strokes: [Stroke; 4],
+}
+
+impl egui::Widget for AnimatedButton {
+    fn ui(self, ui: &mut egui::Ui) -> egui::Response {
+        ui.scope(|ui| {
+            let widgets = &mut ui.visuals_mut().widgets;
+            widgets.inactive.bg_fill = self.fills[0];
+            widgets.inactive.weak_bg_fill = self.fills[0];
+            widgets.inactive.bg_stroke = self.strokes[0];
+            widgets.hovered.bg_fill = self.fills[1];
+            widgets.hovered.weak_bg_fill = self.fills[1];
+            widgets.hovered.bg_stroke = self.strokes[1];
+            widgets.active.bg_fill = self.fills[2];
+            widgets.active.weak_bg_fill = self.fills[2];
+            widgets.active.bg_stroke = self.strokes[2];
+            widgets.open.bg_fill = self.fills[3];
+            widgets.open.weak_bg_fill = self.fills[3];
+            widgets.open.bg_stroke = self.strokes[3];
+            ui.add(self.button)
+        })
+        .inner
+    }
+}
+
+/// Applies animated idle and hover fills/strokes to an egui button.
+pub fn animated_button(
+    button: egui::Button<'static>,
+    idle_fill: Color32,
+    hover_fill: Color32,
+    idle_stroke: Stroke,
+    hover_stroke: Stroke,
+) -> AnimatedButton {
+    AnimatedButton {
+        button,
+        fills: [idle_fill, hover_fill, hover_fill, idle_fill],
+        strokes: [idle_stroke, hover_stroke, hover_stroke, idle_stroke],
+    }
+}
+
+/// Interpolates a custom-painted interactive element's background on hover.
+pub fn animated_hover_fill(
+    ui: &egui::Ui,
+    id: egui::Id,
+    hovered: bool,
+    idle_fill: Color32,
+    hover_fill: Color32,
+) -> Color32 {
+    let amount = ui
+        .ctx()
+        .animate_bool_with_time(id, hovered, ui.style().animation_time);
+    idle_fill.lerp_to_gamma(hover_fill, amount)
+}
+
 /// A filled accent button (used for primary actions like Start).
-pub fn primary_button(text: &str) -> egui::Button<'static> {
-    egui::Button::new(egui::RichText::new(text).color(BACKGROUND).strong())
-        .fill(PRIMARY)
-        .stroke(Stroke::NONE)
+pub fn primary_button(text: &str) -> AnimatedButton {
+    animated_button(
+        egui::Button::new(egui::RichText::new(text).color(BACKGROUND).strong()),
+        PRIMARY,
+        PRIMARY_HOVER,
+        Stroke::NONE,
+        Stroke::NONE,
+    )
 }
 
 /// A subtle filled button for secondary actions (Stop, Restart, Copy…).
-pub fn secondary_button(text: &str) -> egui::Button<'static> {
-    egui::Button::new(egui::RichText::new(text).color(TEXT))
-        .fill(SURFACE_HOVER)
-        .stroke(Stroke::new(1.0_f32, BORDER))
+pub fn secondary_button(text: &str) -> AnimatedButton {
+    animated_button(
+        egui::Button::new(egui::RichText::new(text).color(TEXT)),
+        SURFACE_HOVER,
+        SURFACE_ACTIVE,
+        Stroke::new(1.0_f32, BORDER),
+        Stroke::new(1.0_f32, PRIMARY.gamma_multiply(0.6)),
+    )
 }
 
 /// A transparent button with just a border (Settings, Import, Cancel…).
-pub fn ghost_button(text: &str) -> egui::Button<'static> {
-    egui::Button::new(egui::RichText::new(text).color(TEXT_MUTED))
-        .fill(Color32::TRANSPARENT)
-        .stroke(Stroke::new(1.0_f32, BORDER))
+pub fn ghost_button(text: &str) -> AnimatedButton {
+    animated_button(
+        egui::Button::new(egui::RichText::new(text).color(TEXT_MUTED)),
+        Color32::TRANSPARENT,
+        SURFACE_HOVER,
+        Stroke::new(1.0_f32, BORDER),
+        Stroke::new(1.0_f32, PRIMARY.gamma_multiply(0.6)),
+    )
 }
 
 /// A tinted button for destructive actions (Kill, Remove).
-pub fn danger_button(text: &str) -> egui::Button<'static> {
-    egui::Button::new(egui::RichText::new(text).color(ERROR).strong())
-        .fill(ERROR.gamma_multiply(0.12))
-        .stroke(Stroke::new(1.0_f32, ERROR.gamma_multiply(0.55)))
+pub fn danger_button(text: &str) -> AnimatedButton {
+    animated_button(
+        egui::Button::new(egui::RichText::new(text).color(ERROR).strong()),
+        ERROR.gamma_multiply(0.12),
+        ERROR.gamma_multiply(0.24),
+        Stroke::new(1.0_f32, ERROR.gamma_multiply(0.55)),
+        Stroke::new(1.0_f32, ERROR),
+    )
 }
 
 /// A small-caps, muted heading that introduces a section.
@@ -277,38 +352,58 @@ pub fn title_with_icon(glyph: &str, text: &str, icon_color: Color32) -> egui::te
 }
 
 /// A filled accent button with a leading icon (Start, Create, Save…).
-pub fn primary_icon_button(glyph: &str, text: &str) -> egui::Button<'static> {
-    egui::Button::new(icon_text_job(glyph, text, BACKGROUND))
-        .fill(PRIMARY)
-        .stroke(Stroke::NONE)
+pub fn primary_icon_button(glyph: &str, text: &str) -> AnimatedButton {
+    animated_button(
+        egui::Button::new(icon_text_job(glyph, text, BACKGROUND)),
+        PRIMARY,
+        PRIMARY_HOVER,
+        Stroke::NONE,
+        Stroke::NONE,
+    )
 }
 
 /// A subtle filled button with a leading icon (Stop, Restart, Copy…).
-pub fn secondary_icon_button(glyph: &str, text: &str) -> egui::Button<'static> {
-    egui::Button::new(icon_text_job(glyph, text, TEXT))
-        .fill(SURFACE_HOVER)
-        .stroke(Stroke::new(1.0_f32, BORDER))
+pub fn secondary_icon_button(glyph: &str, text: &str) -> AnimatedButton {
+    animated_button(
+        egui::Button::new(icon_text_job(glyph, text, TEXT)),
+        SURFACE_HOVER,
+        SURFACE_ACTIVE,
+        Stroke::new(1.0_f32, BORDER),
+        Stroke::new(1.0_f32, PRIMARY.gamma_multiply(0.6)),
+    )
 }
 
 /// A transparent button with a border and a leading icon (Settings, Import, Cancel…).
-pub fn ghost_icon_button(glyph: &str, text: &str) -> egui::Button<'static> {
-    egui::Button::new(icon_text_job(glyph, text, TEXT_MUTED))
-        .fill(Color32::TRANSPARENT)
-        .stroke(Stroke::new(1.0_f32, BORDER))
+pub fn ghost_icon_button(glyph: &str, text: &str) -> AnimatedButton {
+    animated_button(
+        egui::Button::new(icon_text_job(glyph, text, TEXT_MUTED)),
+        Color32::TRANSPARENT,
+        SURFACE_HOVER,
+        Stroke::new(1.0_f32, BORDER),
+        Stroke::new(1.0_f32, PRIMARY.gamma_multiply(0.6)),
+    )
 }
 
 /// A tinted destructive button with a leading icon (Kill, Remove).
-pub fn danger_icon_button(glyph: &str, text: &str) -> egui::Button<'static> {
-    egui::Button::new(icon_text_job(glyph, text, ERROR))
-        .fill(ERROR.gamma_multiply(0.12))
-        .stroke(Stroke::new(1.0_f32, ERROR.gamma_multiply(0.55)))
+pub fn danger_icon_button(glyph: &str, text: &str) -> AnimatedButton {
+    animated_button(
+        egui::Button::new(icon_text_job(glyph, text, ERROR)),
+        ERROR.gamma_multiply(0.12),
+        ERROR.gamma_multiply(0.24),
+        Stroke::new(1.0_f32, ERROR.gamma_multiply(0.55)),
+        Stroke::new(1.0_f32, ERROR),
+    )
 }
 
 /// A tinted attention button with a leading icon (update available).
-pub fn warn_icon_button(glyph: &str, text: &str) -> egui::Button<'static> {
-    egui::Button::new(icon_text_job(glyph, text, WARN))
-        .fill(WARN.gamma_multiply(0.12))
-        .stroke(Stroke::new(1.0_f32, WARN.gamma_multiply(0.55)))
+pub fn warn_icon_button(glyph: &str, text: &str) -> AnimatedButton {
+    animated_button(
+        egui::Button::new(icon_text_job(glyph, text, WARN)),
+        WARN.gamma_multiply(0.12),
+        WARN.gamma_multiply(0.24),
+        Stroke::new(1.0_f32, WARN.gamma_multiply(0.55)),
+        Stroke::new(1.0_f32, WARN),
+    )
 }
 
 /// A rounded card container.
@@ -322,18 +417,24 @@ pub fn card() -> egui::Frame {
 
 /// A dashboard-style navigation tab: filled accent pill when active,
 /// quiet transparent text button otherwise.
-pub fn nav_tab(active: bool, glyph: &str, label: &str) -> egui::Button<'static> {
+pub fn nav_tab(active: bool, glyph: &str, label: &str) -> AnimatedButton {
     let rounding = egui::CornerRadius::same(255);
     if active {
-        egui::Button::new(icon_text_job(glyph, label, BACKGROUND))
-            .fill(PRIMARY)
-            .stroke(Stroke::NONE)
-            .corner_radius(rounding)
+        animated_button(
+            egui::Button::new(icon_text_job(glyph, label, BACKGROUND)).corner_radius(rounding),
+            PRIMARY,
+            PRIMARY_HOVER,
+            Stroke::NONE,
+            Stroke::NONE,
+        )
     } else {
-        egui::Button::new(icon_text_job(glyph, label, TEXT_MUTED))
-            .fill(Color32::TRANSPARENT)
-            .stroke(Stroke::NONE)
-            .corner_radius(rounding)
+        animated_button(
+            egui::Button::new(icon_text_job(glyph, label, TEXT_MUTED)).corner_radius(rounding),
+            Color32::TRANSPARENT,
+            SURFACE_HOVER,
+            Stroke::NONE,
+            Stroke::NONE,
+        )
     }
 }
 

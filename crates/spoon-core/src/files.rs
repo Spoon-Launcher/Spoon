@@ -82,6 +82,78 @@ pub fn ensure_within(root: &Path, candidate: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Copies a directory and its contents, rejecting symbolic links.
+pub fn copy_directory(source: &Path, target: &Path) -> io::Result<()> {
+    if !source.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("server folder does not exist: {}", source.display()),
+        ));
+    }
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::create_dir(target)?;
+    match copy_directory_contents(source, target, false) {
+        Ok(()) => Ok(()),
+        Err(copy_error) => match fs::remove_dir_all(target) {
+            Ok(()) => Err(copy_error),
+            Err(cleanup_error) if cleanup_error.kind() == io::ErrorKind::NotFound => {
+                Err(copy_error)
+            }
+            Err(cleanup_error) => Err(io::Error::new(
+                copy_error.kind(),
+                format!(
+                    "{copy_error}; partial copy folder could not be removed ({}): {cleanup_error}",
+                    target.display()
+                ),
+            )),
+        },
+    }
+}
+
+/// Copies a directory's contents into an existing target directory.
+/// When `skip_root_server_jar` is true, only a root-level `server.jar` is skipped.
+pub fn copy_directory_contents(
+    source: &Path,
+    target: &Path,
+    skip_root_server_jar: bool,
+) -> io::Result<()> {
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "server folder contains a symbolic link: {}",
+                    source_path.display()
+                ),
+            ));
+        }
+        if skip_root_server_jar && entry.file_name() == "server.jar" {
+            continue;
+        }
+        if file_type.is_dir() {
+            fs::create_dir_all(&target_path)?;
+            copy_directory_contents(&source_path, &target_path, false)?;
+        } else if file_type.is_file() {
+            fs::copy(&source_path, &target_path)?;
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported file in server folder: {}",
+                    source_path.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Picks a non-existing `base.zip` / `base-2.zip` / ... name inside `dir`.
 pub fn unique_zip_path(dir: &Path, base: &str) -> PathBuf {
     let mut candidate = dir.join(format!("{base}.zip"));
@@ -173,6 +245,29 @@ fn add_to_zip<W: io::Write + io::Seek>(
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn copies_directory_contents_recursively() {
+        let root = std::env::temp_dir().join(format!(
+            "spoon-copy-test-{}-{}",
+            std::process::id(),
+            crate::new_id()
+        ));
+        let source = root.join("source");
+        let target = root.join("copy");
+        fs::create_dir_all(source.join("world")).unwrap();
+        fs::write(source.join("server.jar"), b"jar").unwrap();
+        fs::write(source.join("world").join("level.dat"), b"world").unwrap();
+
+        copy_directory(&source, &target).unwrap();
+
+        assert_eq!(fs::read(target.join("server.jar")).unwrap(), b"jar");
+        assert_eq!(
+            fs::read(target.join("world").join("level.dat")).unwrap(),
+            b"world"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn zips_files_and_folders_with_relative_names() {

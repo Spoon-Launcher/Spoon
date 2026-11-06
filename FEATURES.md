@@ -30,7 +30,7 @@ Status: ✅ Done · 🟡 In Progress · ⬜ Planned
 - ✅ EULA acceptance helper
 - ✅ Edit server.properties from the GUI
 - ✅ Version changer in server settings
-- ✅ Import existing server folder
+- ✅ Import existing server folder into Spoon's server directory
 
 ## Monitoring
 
@@ -49,8 +49,8 @@ Status: ✅ Done · 🟡 In Progress · ⬜ Planned
 - ⬜ Modrinth/Spigot Plugin Installer
 - ⬜ Modrinth/Curseforge Mod Installer
 - ⬜ Player Management
-- ✅ File Browser / File editor
-- ✅ Private Java runtimes — download/remove JDKs from inside the app (App Settings); they live in Spoon's own folder and don't touch the system Java
+- ✅ File Browser / File editor / Open server folder
+- ✅ Private Java runtimes
 - ⬜ Playit.gg Tunnel Support
 
 ## Platform / Packaging
