@@ -8,6 +8,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 dirs = "6"
 flate2 = "1"
 indexmap = { version = "2", features = ["serde"] }
+md-5 = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "json"] }
 semver = "1"
 serde = { version = "1", features = ["derive"] }

@@ -1,6 +1,7 @@
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
@@ -13,6 +14,11 @@ use spoon_core::files::{self, FileContent, FileEntry};
 use spoon_core::highlight::{self, Language, TokenKind};
 use spoon_core::java::{fetch_candidates, JavaCandidate, JavaRuntime, JavaStore};
 use spoon_core::mcjars::{McJarsClient, ServerType, SoftwareSnapshot, VersionEntry};
+use spoon_core::players::{
+    add_ip_ban, add_player_ban, add_whitelist_player, fetch_player_skin, is_minecraft_username,
+    parse_position_command_output, read_player_catalog, read_player_details, remove_ip_ban,
+    remove_player_ban, remove_whitelist_player, PlayerCatalog, PlayerDetails, PlayerProfile,
+};
 use spoon_core::updater::{updates_dir, UpdateClient, UpdateInfo};
 use spoon_core::{
     new_id, unique_server_dir, AppSettings, LogLine, ServerConfig, ServerHandle, ServerState,
@@ -33,10 +39,13 @@ const SOFTWARE_REFRESH_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const SOFTWARE_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 /// Icon textures built per frame, so a burst of finished downloads can't stall one frame.
 const MAX_ICONS_PER_FRAME: usize = 4;
+const MAX_PLAYER_SKINS_IN_FLIGHT: usize = 4;
+const PLAYER_MANAGEMENT_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const BACKUP_STATUS_DURATION: Duration = Duration::from_secs(4);
 
 /// Result of one software icon download: the lowercase software name plus the raw PNG bytes.
 type IconFetch = (String, Result<Vec<u8>, String>);
+type PlayerSkinFetch = (String, Result<Vec<u8>, String>);
 
 /// The MCJars software and version catalog, loaded at launch and refreshed in
 /// the background so the pickers never wait on the network.
@@ -137,6 +146,302 @@ enum ServerPage {
     Players,
     Backups,
     Settings,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlayerView {
+    Online,
+    Offline,
+    Whitelist,
+    IpBans,
+}
+
+enum PlayerManagementResult {
+    Loaded(PlayerCatalog),
+    Added(PlayerProfile),
+    Removed(String),
+    Banned(PlayerProfile),
+    Unbanned(String),
+    IpBanned(String),
+    IpUnbanned(String),
+}
+
+struct PlayerManagementState {
+    view: PlayerView,
+    catalog: Option<PlayerCatalog>,
+    username: String,
+    ip_address: String,
+    pending: Option<Receiver<Result<PlayerManagementResult, String>>>,
+    last_refresh: Option<Instant>,
+    error: Option<String>,
+    notice: Option<String>,
+}
+
+impl PlayerManagementState {
+    fn new() -> Self {
+        Self {
+            view: PlayerView::Online,
+            catalog: None,
+            username: String::new(),
+            ip_address: String::new(),
+            pending: None,
+            last_refresh: None,
+            error: None,
+            notice: None,
+        }
+    }
+
+    fn refresh(&mut self, working_dir: PathBuf, clear_feedback: bool) {
+        if self.pending.is_some() {
+            return;
+        }
+        if clear_feedback {
+            self.error = None;
+            self.notice = None;
+        }
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = read_player_catalog(&working_dir).map(PlayerManagementResult::Loaded);
+            let _ = tx.send(result);
+        });
+        self.pending = Some(rx);
+    }
+
+    fn add(&mut self, working_dir: PathBuf) {
+        if self.pending.is_some() {
+            return;
+        }
+        let username = self.username.trim().to_string();
+        if !is_minecraft_username(&username) {
+            self.error = Some(
+                "Enter a valid Minecraft username (1-16 letters, numbers, or underscores)."
+                    .to_string(),
+            );
+            self.notice = None;
+            return;
+        }
+        self.error = None;
+        self.notice = None;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result =
+                add_whitelist_player(&working_dir, &username).map(PlayerManagementResult::Added);
+            let _ = tx.send(result);
+        });
+        self.pending = Some(rx);
+    }
+
+    fn remove(&mut self, working_dir: PathBuf, uuid: String) {
+        if self.pending.is_some() {
+            return;
+        }
+        self.error = None;
+        self.notice = None;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = remove_whitelist_player(&working_dir, &uuid)
+                .map(|()| PlayerManagementResult::Removed(uuid));
+            let _ = tx.send(result);
+        });
+        self.pending = Some(rx);
+    }
+
+    fn ban_player(&mut self, working_dir: PathBuf, username: String) {
+        if self.pending.is_some() {
+            return;
+        }
+        self.error = None;
+        self.notice = None;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result =
+                add_player_ban(&working_dir, &username).map(PlayerManagementResult::Banned);
+            let _ = tx.send(result);
+        });
+        self.pending = Some(rx);
+    }
+
+    fn unban_player(&mut self, working_dir: PathBuf, uuid: String) {
+        if self.pending.is_some() {
+            return;
+        }
+        self.error = None;
+        self.notice = None;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = remove_player_ban(&working_dir, &uuid)
+                .map(|()| PlayerManagementResult::Unbanned(uuid));
+            let _ = tx.send(result);
+        });
+        self.pending = Some(rx);
+    }
+
+    fn ban_ip(&mut self, working_dir: PathBuf, ip: String) {
+        if self.pending.is_some() {
+            return;
+        }
+        self.error = None;
+        self.notice = None;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = add_ip_ban(&working_dir, &ip).map(PlayerManagementResult::IpBanned);
+            let _ = tx.send(result);
+        });
+        self.pending = Some(rx);
+    }
+
+    fn unban_ip(&mut self, working_dir: PathBuf, ip: String) {
+        if self.pending.is_some() {
+            return;
+        }
+        self.error = None;
+        self.notice = None;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result =
+                remove_ip_ban(&working_dir, &ip).map(|()| PlayerManagementResult::IpUnbanned(ip));
+            let _ = tx.send(result);
+        });
+        self.pending = Some(rx);
+    }
+
+    fn poll(&mut self, handle: Option<&mut ServerHandle>) -> bool {
+        let result = self.pending.as_ref().map(Receiver::try_recv);
+        match result {
+            Some(Ok(Ok(PlayerManagementResult::Loaded(catalog)))) => {
+                self.pending = None;
+                self.catalog = Some(catalog);
+                self.error = None;
+                self.notice = None;
+            }
+            Some(Ok(Ok(PlayerManagementResult::Added(profile)))) => {
+                self.pending = None;
+                let whitelist = &mut self
+                    .catalog
+                    .get_or_insert_with(PlayerCatalog::default)
+                    .whitelist;
+                whitelist.push(profile.clone());
+                whitelist.sort_by(|left, right| {
+                    left.name
+                        .to_ascii_lowercase()
+                        .cmp(&right.name.to_ascii_lowercase())
+                });
+                self.username.clear();
+                self.notice = Some(format!("Added {} to the whitelist.", profile.name));
+                if let Some(handle) = handle {
+                    if handle.state() != ServerState::Stopped {
+                        handle.send_command("whitelist reload");
+                    }
+                }
+            }
+            Some(Ok(Ok(PlayerManagementResult::Removed(uuid)))) => {
+                self.pending = None;
+                if let Some(catalog) = &mut self.catalog {
+                    catalog
+                        .whitelist
+                        .retain(|profile| !profile.uuid.eq_ignore_ascii_case(&uuid));
+                }
+                self.notice = Some("Removed player from the whitelist.".to_string());
+                if let Some(handle) = handle {
+                    if handle.state() != ServerState::Stopped {
+                        handle.send_command("whitelist reload");
+                    }
+                }
+            }
+            Some(Ok(Ok(PlayerManagementResult::Banned(profile)))) => {
+                self.pending = None;
+                let banned_players = &mut self
+                    .catalog
+                    .get_or_insert_with(PlayerCatalog::default)
+                    .banned_players;
+                banned_players.push(profile.clone());
+                banned_players.sort_by(|left, right| {
+                    left.name
+                        .to_ascii_lowercase()
+                        .cmp(&right.name.to_ascii_lowercase())
+                });
+                self.notice = Some(format!(
+                    "Banned {} for the next server start.",
+                    profile.name
+                ));
+            }
+            Some(Ok(Ok(PlayerManagementResult::Unbanned(uuid)))) => {
+                self.pending = None;
+                if let Some(catalog) = &mut self.catalog {
+                    catalog
+                        .banned_players
+                        .retain(|profile| !profile.uuid.eq_ignore_ascii_case(&uuid));
+                }
+                self.notice = Some("Removed the player ban for the next server start.".to_string());
+            }
+            Some(Ok(Ok(PlayerManagementResult::IpBanned(ip)))) => {
+                self.pending = None;
+                self.ip_address.clear();
+                let banned_ips = &mut self
+                    .catalog
+                    .get_or_insert_with(PlayerCatalog::default)
+                    .banned_ips;
+                banned_ips.push(ip.clone());
+                banned_ips.sort_by_key(|address| address.to_ascii_lowercase());
+                self.notice = Some(format!("Banned IP {ip} for the next server start."));
+            }
+            Some(Ok(Ok(PlayerManagementResult::IpUnbanned(ip)))) => {
+                self.pending = None;
+                if let Some(catalog) = &mut self.catalog {
+                    catalog.banned_ips.retain(|address| {
+                        address
+                            .parse::<IpAddr>()
+                            .map(|existing| existing.to_string() != ip)
+                            .unwrap_or(true)
+                    });
+                }
+                self.notice = Some(format!(
+                    "Removed IP ban for {ip} for the next server start."
+                ));
+            }
+            Some(Ok(Err(err))) => {
+                self.pending = None;
+                self.error = Some(err);
+                self.notice = None;
+            }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.pending = None;
+                self.error = Some("Player management task stopped unexpectedly.".to_string());
+                self.notice = None;
+            }
+            Some(Err(mpsc::TryRecvError::Empty)) => return true,
+            None => return false,
+        }
+        false
+    }
+}
+
+struct PlayerDetailsDialog {
+    server_index: usize,
+    name: String,
+    is_online: bool,
+    details_rx: Option<Receiver<Result<PlayerDetails, String>>>,
+    details: Option<PlayerDetails>,
+    error: Option<String>,
+    action_error: Option<String>,
+    action_notice: Option<String>,
+    message: String,
+    live_position: Option<[f64; 3]>,
+    position_query_started: Option<Instant>,
+}
+
+enum PlayerDetailsAction {
+    SendCommand {
+        command: String,
+        notice: String,
+        requires_online: bool,
+    },
+    AddPlayerBan,
+    RemovePlayerBan(String),
+    AddIpBan(String),
+    RemoveIpBan(String),
+    AddToWhitelist,
+    RemoveFromWhitelist(String),
 }
 
 struct ImportDialog {
@@ -267,6 +572,7 @@ pub struct ServerEntry {
     memory_bytes: u64,
     online_players: BTreeSet<String>,
     max_players: u32,
+    player_management: PlayerManagementState,
 }
 
 impl ServerEntry {
@@ -288,6 +594,7 @@ impl ServerEntry {
             memory_bytes: 0,
             online_players: BTreeSet::new(),
             max_players,
+            player_management: PlayerManagementState::new(),
         }
     }
 
@@ -464,6 +771,12 @@ pub struct SpoonApp {
     icon_pending: BTreeSet<String>,
     icon_tx: Sender<IconFetch>,
     icon_rx: Receiver<IconFetch>,
+    player_skin_textures: HashMap<String, Option<egui::TextureHandle>>,
+    player_skin_pending: BTreeSet<String>,
+    player_skin_requests: BTreeSet<String>,
+    player_skin_tx: Sender<PlayerSkinFetch>,
+    player_skin_rx: Receiver<PlayerSkinFetch>,
+    player_details: Option<PlayerDetailsDialog>,
     software: SoftwareCache,
 }
 
@@ -509,6 +822,7 @@ impl SpoonApp {
                 .send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(520.0, 320.0)));
         }
         let (icon_tx, icon_rx) = mpsc::channel();
+        let (player_skin_tx, player_skin_rx) = mpsc::channel();
         let (update_tx, update_rx) = mpsc::channel();
         std::thread::spawn(move || {
             let result = UpdateClient::new(env!("CARGO_PKG_VERSION"))
@@ -565,6 +879,12 @@ impl SpoonApp {
             icon_pending: BTreeSet::new(),
             icon_tx,
             icon_rx,
+            player_skin_textures: HashMap::new(),
+            player_skin_pending: BTreeSet::new(),
+            player_skin_requests: BTreeSet::new(),
+            player_skin_tx,
+            player_skin_rx,
+            player_details: None,
             software: SoftwareCache::new(),
         }
     }
@@ -581,6 +901,7 @@ impl SpoonApp {
     fn select_server(&mut self, index: usize) {
         self.selected = Some(index);
         self.page = ServerPage::Overview;
+        self.player_details = None;
         self.settings_dialog = None;
         self.files_dialog = None;
         self.backups_dialog = None;
@@ -603,6 +924,7 @@ impl SpoonApp {
             return;
         }
         self.page = page;
+        self.player_details = None;
         match page {
             ServerPage::Files => {
                 if let Some(dialog) = &mut self.files_dialog {
@@ -622,13 +944,25 @@ impl SpoonApp {
                     ));
                 }
             }
+            ServerPage::Players => {
+                let entry = &mut self.servers[index];
+                entry
+                    .player_management
+                    .refresh(entry.config.working_dir.clone(), true);
+                entry.player_management.last_refresh = Some(Instant::now());
+                if let Some(handle) = entry.handle.as_mut() {
+                    if handle.state() != ServerState::Stopped {
+                        handle.send_command("list");
+                    }
+                }
+            }
             _ => {}
         }
     }
 
     fn poll_servers(&mut self, ctx: &egui::Context) {
         let mut active = false;
-        for entry in &mut self.servers {
+        for (index, entry) in self.servers.iter_mut().enumerate() {
             let (lines, running) = match entry.handle.as_mut() {
                 Some(handle) => {
                     let lines = handle.poll_logs();
@@ -638,8 +972,21 @@ impl SpoonApp {
                 None => (Vec::new(), false),
             };
             if !lines.is_empty() {
+                if let Some(dialog) = &mut self.player_details {
+                    if dialog.server_index == index && dialog.live_position.is_none() {
+                        dialog.live_position = lines.iter().rev().find_map(|line| {
+                            parse_position_command_output(&line.text, &dialog.name)
+                        });
+                        if dialog.live_position.is_some() {
+                            dialog.position_query_started = None;
+                        }
+                    }
+                }
                 for line in &lines {
                     update_online_players(&mut entry.online_players, &line.text);
+                    if let Some(players) = parse_online_player_list(&line.text) {
+                        entry.online_players = players.into_iter().collect();
+                    }
                 }
                 entry.push_logs(lines);
                 ctx.request_repaint();
@@ -675,6 +1022,45 @@ impl SpoonApp {
             // Keep repainting while a server is up so state changes are seen
             // even when the console is quiet.
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        }
+    }
+
+    fn poll_player_management(&mut self, ctx: &egui::Context) {
+        let mut pending = false;
+        for entry in &mut self.servers {
+            pending |= entry.player_management.poll(entry.handle.as_mut());
+        }
+        if pending {
+            ctx.request_repaint_after(Duration::from_millis(150));
+        }
+    }
+
+    fn refresh_player_management_if_due(&mut self, ctx: &egui::Context) {
+        if self.page != ServerPage::Players {
+            return;
+        }
+        ctx.request_repaint_after(PLAYER_MANAGEMENT_REFRESH_INTERVAL);
+        let Some(index) = self.selected else {
+            return;
+        };
+        let Some(entry) = self.servers.get_mut(index) else {
+            return;
+        };
+        let due = entry
+            .player_management
+            .last_refresh
+            .is_none_or(|last| last.elapsed() >= PLAYER_MANAGEMENT_REFRESH_INTERVAL);
+        if !due {
+            return;
+        }
+        entry
+            .player_management
+            .refresh(entry.config.working_dir.clone(), false);
+        entry.player_management.last_refresh = Some(Instant::now());
+        if let Some(handle) = entry.handle.as_mut() {
+            if handle.state() != ServerState::Stopped {
+                handle.send_command("list");
+            }
         }
     }
 
@@ -1104,6 +1490,11 @@ impl eframe::App for SpoonApp {
             }
         }
         self.poll_servers(ctx);
+        self.refresh_player_management_if_due(ctx);
+        self.poll_player_management(ctx);
+        self.poll_player_details(ctx);
+        self.poll_player_skins(ctx);
+        self.ensure_player_skins();
         self.poll_duplicate_task();
         self.poll_update(ctx);
         if self.duplicate_task.is_some() {
@@ -1123,6 +1514,7 @@ impl eframe::App for SpoonApp {
         self.render_update_dialog(ctx);
         self.render_version_dialog(ctx);
         self.render_app_settings_dialog(ctx);
+        self.render_player_details(ctx);
     }
 }
 
@@ -2157,21 +2549,52 @@ impl SpoonApp {
         }
     }
 
-    /// Players page: who is online, detected from join/leave messages.
+    /// Player lists and whitelist management for the selected server.
     fn render_players_page(&mut self, ui: &mut egui::Ui, index: usize) {
+        let skin_textures = &self.player_skin_textures;
         let entry = &mut self.servers[index];
-        let players: Vec<String> = entry.online_players.iter().cloned().collect();
-        let max_players = entry.max_players;
-
+        let online_players = entry.online_players.iter().cloned().collect::<Vec<_>>();
+        let online_names = online_players
+            .iter()
+            .map(|name| name.to_ascii_lowercase())
+            .collect::<HashSet<_>>();
+        let catalog = entry.player_management.catalog.clone();
+        let offline_players = catalog
+            .as_ref()
+            .map(|catalog| {
+                catalog
+                    .known_players
+                    .iter()
+                    .filter(|player| !online_names.contains(&player.name.to_ascii_lowercase()))
+                    .map(|player| player.name.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let whitelist = catalog
+            .as_ref()
+            .map(|catalog| catalog.whitelist.clone())
+            .unwrap_or_default();
+        let ip_bans = catalog
+            .as_ref()
+            .map(|catalog| catalog.banned_ips.clone())
+            .unwrap_or_default();
+        let server_running = entry
+            .handle
+            .as_ref()
+            .is_some_and(|handle| handle.state() != ServerState::Stopped);
+        let mut selected_view = entry.player_management.view;
         let mut copy = false;
+        let mut add_player = false;
+        let mut remove_player = None;
+        let mut add_ip_entry = false;
+        let mut remove_ip_entry = None;
+        let mut selected_player = None;
+        let mut visible_skin_requests = Vec::new();
         ui.horizontal(|ui| {
-            theme::section_title_with_icon(
-                ui,
-                theme::icons::USERS,
-                &format!("ONLINE PLAYERS · {} / {max_players}", players.len()),
-            );
+            theme::section_title_with_icon(ui, theme::icons::USERS, "PLAYER MANAGEMENT");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if !players.is_empty()
+                if selected_view == PlayerView::Online
+                    && !online_players.is_empty()
                     && ui
                         .add(theme::ghost_icon_button(theme::icons::COPY, "Copy list"))
                         .clicked()
@@ -2180,47 +2603,1013 @@ impl SpoonApp {
                 }
             });
         });
-        ui.add_space(6.0);
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            for (view, glyph, label) in [
+                (
+                    PlayerView::Online,
+                    theme::icons::USERS,
+                    format!("Online ({})", online_players.len()),
+                ),
+                (
+                    PlayerView::Offline,
+                    theme::icons::CLOCK,
+                    format!("Offline ({})", offline_players.len()),
+                ),
+                (
+                    PlayerView::Whitelist,
+                    theme::icons::CHECK,
+                    format!("Whitelist ({})", whitelist.len()),
+                ),
+                (
+                    PlayerView::IpBans,
+                    theme::icons::GLOBE,
+                    format!("IP Bans ({})", ip_bans.len()),
+                ),
+            ] {
+                if ui
+                    .add(theme::nav_tab(selected_view == view, glyph, &label))
+                    .clicked()
+                {
+                    selected_view = view;
+                }
+            }
+        });
+        entry.player_management.view = selected_view;
+        ui.add_space(10.0);
 
-        if players.is_empty() {
-            theme::card().show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.add_space(12.0);
-                ui.vertical_centered(|ui| {
-                    ui.label(theme::icon(theme::icons::USERS, 28.0).color(theme::TEXT_MUTED));
-                    ui.add_space(6.0);
+        if let Some(error) = &entry.player_management.error {
+            ui.label(egui::RichText::new(error).color(theme::ERROR));
+            ui.add_space(6.0);
+        }
+        if let Some(notice) = &entry.player_management.notice {
+            ui.label(egui::RichText::new(notice).color(theme::PRIMARY));
+            ui.add_space(6.0);
+        }
+
+        match selected_view {
+            PlayerView::Online => render_player_list(
+                ui,
+                &online_players,
+                skin_textures,
+                PlayerListPresentation {
+                    status: "ONLINE",
+                    status_color: theme::PRIMARY,
+                    empty_title: "No players online",
+                    empty_hint: "Players appear here when they join the server.",
+                    is_online: true,
+                },
+                &mut selected_player,
+                &mut visible_skin_requests,
+            ),
+            PlayerView::Offline => {
+                if entry.player_management.catalog.is_none() {
+                    render_player_list_loading(ui, entry.player_management.pending.is_some());
+                } else {
+                    render_player_list(
+                        ui,
+                        &offline_players,
+                        skin_textures,
+                        PlayerListPresentation {
+                            status: "OFFLINE",
+                            status_color: theme::TEXT_MUTED,
+                            empty_title: "No offline players found",
+                            empty_hint: "Players appear here after they have joined the server.",
+                            is_online: false,
+                        },
+                        &mut selected_player,
+                        &mut visible_skin_requests,
+                    );
+                }
+            }
+            PlayerView::Whitelist => {
+                let pending = entry.player_management.pending.is_some();
+                let can_edit = !pending && entry.player_management.catalog.is_some();
+                theme::section_title_with_icon(ui, theme::icons::CHECK, "WHITELIST");
+                ui.add_space(4.0);
+                theme::card().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
                     ui.label(
-                        egui::RichText::new("No players online")
-                            .size(16.0)
-                            .strong()
+                        egui::RichText::new("Add a player by Minecraft username")
                             .color(theme::TEXT),
                     );
-                    ui.add_space(2.0);
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.add_enabled_ui(can_edit, |ui| {
+                            let response = ui.add(
+                                egui::TextEdit::singleline(
+                                    &mut entry.player_management.username,
+                                )
+                                .desired_width(300.0)
+                                .hint_text("Username"),
+                            );
+                            if response.lost_focus()
+                                && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                            {
+                                add_player = true;
+                            }
+                            if ui
+                                .add(theme::primary_icon_button(
+                                    theme::icons::PLUS,
+                                    "Add",
+                                ))
+                                .clicked()
+                            {
+                                add_player = true;
+                            }
+                        });
+                    });
+                    ui.add_space(4.0);
                     ui.label(
                         egui::RichText::new(
-                            "Players appear here once they join — Spoon detects join and leave messages in the console.",
+                            "Online-mode servers look up UUIDs with Mojang; offline-mode servers use offline UUIDs.",
                         )
-                        .size(12.5)
+                        .size(11.0)
                         .color(theme::TEXT_MUTED),
                     );
                 });
-                ui.add_space(12.0);
-            });
-        } else {
-            theme::card().show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.spacing_mut().item_spacing.y = 4.0;
-                for name in &players {
+                ui.add_space(8.0);
+                if pending {
                     ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 8.0;
-                        ui.label(theme::icon(theme::icons::USERS, 15.0).color(theme::PRIMARY));
-                        ui.label(egui::RichText::new(name).color(theme::TEXT));
+                        ui.spinner();
+                        ui.label(
+                            egui::RichText::new("Updating whitelist...").color(theme::TEXT_MUTED),
+                        );
                     });
+                } else if entry.player_management.catalog.is_none() {
+                    render_player_list_loading(ui, false);
+                } else if whitelist.is_empty() {
+                    render_player_list_empty(
+                        ui,
+                        "Whitelist is empty",
+                        "Add a username above to allow a player to join.",
+                    );
+                } else {
+                    ui.spacing_mut().item_spacing.y = 8.0;
+                    for profile in &whitelist {
+                        render_whitelist_row(
+                            ui,
+                            profile,
+                            skin_textures,
+                            can_edit,
+                            &mut remove_player,
+                            &mut visible_skin_requests,
+                        );
+                    }
                 }
-            });
+            }
+            PlayerView::IpBans => {
+                let pending = entry.player_management.pending.is_some();
+                let can_edit = !pending && entry.player_management.catalog.is_some();
+                theme::section_title_with_icon(ui, theme::icons::GLOBE, "IP BANS");
+                ui.add_space(4.0);
+                theme::card().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(
+                        egui::RichText::new("Add an IP address to the ban list").color(theme::TEXT),
+                    );
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        let response = ui.add_enabled(
+                            can_edit,
+                            egui::TextEdit::singleline(&mut entry.player_management.ip_address)
+                                .desired_width(300.0)
+                                .hint_text("IPv4 or IPv6 address"),
+                        );
+                        if response.lost_focus()
+                            && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                        {
+                            add_ip_entry = true;
+                        }
+                        let candidate = entry
+                            .player_management
+                            .ip_address
+                            .trim()
+                            .parse::<IpAddr>()
+                            .ok();
+                        let already_banned = candidate.is_some_and(|candidate| {
+                            ip_bans
+                                .iter()
+                                .any(|ip| ip.parse::<IpAddr>().ok() == Some(candidate))
+                        });
+                        if ui
+                            .add_enabled(
+                                can_edit && candidate.is_some() && !already_banned,
+                                theme::primary_icon_button(theme::icons::PLUS, "Add"),
+                            )
+                            .clicked()
+                        {
+                            add_ip_entry = true;
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(if server_running {
+                            "Changes are sent to the running server."
+                        } else {
+                            "Changes are saved to banned-ips.json for the next server start."
+                        })
+                        .size(11.0)
+                        .color(theme::TEXT_MUTED),
+                    );
+                });
+                ui.add_space(8.0);
+                if pending {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            egui::RichText::new("Updating IP bans...").color(theme::TEXT_MUTED),
+                        );
+                    });
+                } else if entry.player_management.catalog.is_none() {
+                    render_player_list_loading(ui, false);
+                } else if ip_bans.is_empty() {
+                    render_player_list_empty(
+                        ui,
+                        "No IP bans",
+                        "Add an IP address above to block it from joining.",
+                    );
+                } else {
+                    ui.spacing_mut().item_spacing.y = 8.0;
+                    for ip in &ip_bans {
+                        render_ip_ban_row(ui, ip, can_edit, &mut remove_ip_entry);
+                    }
+                }
+            }
         }
         if copy {
-            ui.ctx().copy_text(players.join(", "));
+            ui.ctx().copy_text(online_players.join(", "));
+        }
+        if add_player {
+            entry
+                .player_management
+                .add(entry.config.working_dir.clone());
+        }
+        if let Some(uuid) = remove_player {
+            entry
+                .player_management
+                .remove(entry.config.working_dir.clone(), uuid);
+        }
+        if add_ip_entry {
+            if entry.player_management.pending.is_some()
+                || entry.player_management.catalog.is_none()
+            {
+                entry.player_management.error =
+                    Some("Player data is updating. Try the action again shortly.".to_string());
+                entry.player_management.notice = None;
+            } else if let Ok(address) = entry.player_management.ip_address.trim().parse::<IpAddr>()
+            {
+                let ip = address.to_string();
+                let already_banned = ip_bans
+                    .iter()
+                    .any(|banned| banned.parse::<IpAddr>().ok() == Some(address));
+                if already_banned {
+                    entry.player_management.error = Some(format!("{ip} is already banned."));
+                    entry.player_management.notice = None;
+                } else if server_running {
+                    if let Some(handle) = entry.handle.as_mut() {
+                        handle.send_command(&format!("ban-ip {ip}"));
+                    }
+                    entry.player_management.last_refresh = None;
+                    entry.player_management.error = None;
+                    entry.player_management.ip_address.clear();
+                    entry.player_management.notice = Some(format!("IP ban command sent for {ip}."));
+                } else {
+                    entry
+                        .player_management
+                        .ban_ip(entry.config.working_dir.clone(), ip);
+                }
+            } else {
+                entry.player_management.error = Some("Enter a valid IP address.".to_string());
+                entry.player_management.notice = None;
+            }
+        }
+        if let Some(ip) = remove_ip_entry {
+            if server_running {
+                if let Some(handle) = entry.handle.as_mut() {
+                    handle.send_command(&format!("pardon-ip {ip}"));
+                }
+                entry.player_management.last_refresh = None;
+                entry.player_management.error = None;
+                entry.player_management.notice = Some(format!("IP unban command sent for {ip}."));
+            } else {
+                entry
+                    .player_management
+                    .unban_ip(entry.config.working_dir.clone(), ip);
+            }
+        }
+        self.player_skin_requests.extend(visible_skin_requests);
+        if let Some((name, is_online)) = selected_player {
+            self.open_player_details(index, name, is_online);
+        }
+    }
+
+    fn open_player_details(&mut self, server_index: usize, name: String, is_online: bool) {
+        let Some(entry) = self.servers.get_mut(server_index) else {
+            return;
+        };
+        let working_dir = entry.config.working_dir.clone();
+        let log_lines = entry
+            .console
+            .iter()
+            .map(|line| line.text.clone())
+            .collect::<Vec<_>>();
+        let (tx, rx) = mpsc::channel();
+        let player_name = name.clone();
+        std::thread::spawn(move || {
+            let result = read_player_details(&working_dir, &player_name, &log_lines);
+            let _ = tx.send(result);
+        });
+
+        let position_query_started = if is_online && is_minecraft_username(&name) {
+            entry.handle.as_mut().map(|handle| {
+                handle.send_command(&format!("data get entity {name} Pos"));
+                Instant::now()
+            })
+        } else {
+            None
+        };
+        self.player_details = Some(PlayerDetailsDialog {
+            server_index,
+            name,
+            is_online,
+            details_rx: Some(rx),
+            details: None,
+            error: None,
+            action_error: None,
+            action_notice: None,
+            message: String::new(),
+            live_position: None,
+            position_query_started,
+        });
+    }
+
+    fn poll_player_details(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = &mut self.player_details else {
+            return;
+        };
+        let result = dialog.details_rx.as_ref().map(Receiver::try_recv);
+        match result {
+            Some(Ok(Ok(details))) => {
+                dialog.details = Some(details);
+                dialog.details_rx = None;
+            }
+            Some(Ok(Err(err))) => {
+                dialog.error = Some(err);
+                dialog.details_rx = None;
+            }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                dialog.error = Some("Player details task stopped unexpectedly.".to_string());
+                dialog.details_rx = None;
+            }
+            Some(Err(mpsc::TryRecvError::Empty)) => {
+                ctx.request_repaint_after(Duration::from_millis(150));
+            }
+            None => {}
+        }
+        if dialog
+            .position_query_started
+            .is_some_and(|started| started.elapsed() >= Duration::from_secs(3))
+        {
+            dialog.position_query_started = None;
+        } else if dialog.position_query_started.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(150));
+        }
+    }
+
+    fn render_player_details(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.player_details.take() else {
+            return;
+        };
+        let player_ip = dialog
+            .details
+            .as_ref()
+            .and_then(|details| details.ip_address.as_deref())
+            .and_then(|ip| ip.parse::<IpAddr>().ok());
+        let (
+            is_online,
+            server_running,
+            whitelist_uuid,
+            banned_uuid,
+            is_ip_banned,
+            catalog_loaded,
+            management_pending,
+            management_error,
+            management_notice,
+        ) = self
+            .servers
+            .get(dialog.server_index)
+            .map(|entry| {
+                let whitelist_uuid = entry
+                    .player_management
+                    .catalog
+                    .as_ref()
+                    .and_then(|catalog| {
+                        catalog
+                            .whitelist
+                            .iter()
+                            .find(|profile| profile.name.eq_ignore_ascii_case(&dialog.name))
+                    })
+                    .map(|profile| profile.uuid.clone());
+                let player_uuid = dialog
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.uuid.clone())
+                    .or_else(|| {
+                        entry
+                            .player_management
+                            .catalog
+                            .as_ref()
+                            .and_then(|catalog| {
+                                catalog
+                                    .known_players
+                                    .iter()
+                                    .find(|profile| profile.name.eq_ignore_ascii_case(&dialog.name))
+                                    .map(|profile| profile.uuid.clone())
+                            })
+                    });
+                let banned_profile = entry
+                    .player_management
+                    .catalog
+                    .as_ref()
+                    .and_then(|catalog| {
+                        catalog.banned_players.iter().find(|profile| {
+                            profile.name.eq_ignore_ascii_case(&dialog.name)
+                                || player_uuid
+                                    .as_deref()
+                                    .is_some_and(|uuid| profile.uuid.eq_ignore_ascii_case(uuid))
+                        })
+                    });
+                let is_ip_banned =
+                    entry
+                        .player_management
+                        .catalog
+                        .as_ref()
+                        .is_some_and(|catalog| {
+                            player_ip.is_some_and(|ip| {
+                                catalog
+                                    .banned_ips
+                                    .iter()
+                                    .any(|address| address.parse::<IpAddr>().ok() == Some(ip))
+                            })
+                        });
+                (
+                    entry
+                        .online_players
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(&dialog.name)),
+                    entry
+                        .handle
+                        .as_ref()
+                        .is_some_and(|handle| handle.state() != ServerState::Stopped),
+                    whitelist_uuid,
+                    banned_profile.map(|profile| profile.uuid.clone()),
+                    is_ip_banned,
+                    entry.player_management.catalog.is_some(),
+                    entry.player_management.pending.is_some(),
+                    entry.player_management.error.clone(),
+                    entry.player_management.notice.clone(),
+                )
+            })
+            .unwrap_or((false, false, None, None, false, false, false, None, None));
+        dialog.is_online = is_online;
+        let player_name_valid = is_minecraft_username(&dialog.name);
+        let mut close = false;
+        let mut requested_action = None;
+        let modal = egui::Modal::new(egui::Id::new((
+            "player_details",
+            dialog.server_index,
+            &dialog.name,
+        )))
+        .frame(
+            egui::Frame::new()
+                .fill(theme::SURFACE)
+                .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
+                .corner_radius(egui::CornerRadius::same(12))
+                .inner_margin(egui::Margin::same(20)),
+        )
+        .backdrop_color(egui::Color32::from_black_alpha(140))
+        .show(ctx, |ui| {
+            ui.set_width(500.0);
+            ui.horizontal(|ui| {
+                ui.label(theme::title_with_icon(
+                    theme::icons::USERS,
+                    "Player Details",
+                    theme::PRIMARY,
+                ));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(theme::ghost_icon_button(theme::icons::XMARK, "Close"))
+                        .clicked()
+                    {
+                        close = true;
+                    }
+                });
+            });
+            ui.add_space(12.0);
+            theme::card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.vertical_centered(|ui| {
+                    ui.horizontal(|ui| {
+                        if let Some(Some(texture)) = self
+                            .player_skin_textures
+                            .get(&dialog.name.to_ascii_lowercase())
+                        {
+                            ui.add(
+                                egui::Image::new(texture).fit_to_exact_size(egui::vec2(56.0, 56.0)),
+                            );
+                        } else {
+                            ui.label(
+                                theme::icon(theme::icons::USERS, 40.0).color(theme::TEXT_MUTED),
+                            );
+                        }
+                        ui.vertical_centered(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(&dialog.name)
+                                        .size(18.0)
+                                        .strong()
+                                        .color(theme::TEXT),
+                                );
+                                theme::status_pill(
+                                    ui,
+                                    if dialog.is_online {
+                                        "ONLINE"
+                                    } else {
+                                        "OFFLINE"
+                                    },
+                                    if dialog.is_online {
+                                        theme::PRIMARY
+                                    } else {
+                                        theme::TEXT_MUTED
+                                    },
+                                );
+                            });
+                        });
+                    });
+                });
+            });
+            ui.add_space(10.0);
+
+            if let Some(error) = &dialog.error {
+                ui.label(egui::RichText::new(error).color(theme::ERROR));
+                ui.add_space(8.0);
+            }
+
+            let playtime = dialog
+                .details
+                .as_ref()
+                .and_then(|details| details.play_time_ticks)
+                .map(|ticks| format_duration(Duration::from_secs(ticks / 20)))
+                .unwrap_or_else(|| {
+                    if dialog.details.is_none() && dialog.error.is_none() {
+                        "Loading...".to_string()
+                    } else {
+                        "Unavailable".to_string()
+                    }
+                });
+            let coordinates = if let Some([x, y, z]) = dialog.live_position {
+                format!("{x:.1}, {y:.1}, {z:.1} · Current")
+            } else if let Some([x, y, z]) = dialog
+                .details
+                .as_ref()
+                .and_then(|details| details.last_position)
+            {
+                format!("{x:.1}, {y:.1}, {z:.1} · Last login")
+            } else if dialog.position_query_started.is_some() {
+                "Querying...".to_string()
+            } else {
+                "Unavailable".to_string()
+            };
+            let ip_address = dialog
+                .details
+                .as_ref()
+                .and_then(|details| details.ip_address.as_deref())
+                .unwrap_or("Unavailable");
+            let uuid = dialog
+                .details
+                .as_ref()
+                .and_then(|details| details.uuid.as_deref())
+                .unwrap_or("Unavailable");
+            egui::Grid::new(("player_details_grid", dialog.server_index))
+                .num_columns(2)
+                .spacing([8.0, 8.0])
+                .show(ui, |ui| {
+                    player_detail_card(ui, theme::icons::CLOCK, "Playtime", &playtime);
+                    player_detail_card(ui, theme::icons::LOCATION_DOT, "Coordinates", &coordinates);
+                    ui.end_row();
+                    player_detail_card(ui, theme::icons::GLOBE, "IP Address", ip_address);
+                    player_detail_card(ui, theme::icons::FINGERPRINT, "UUID", uuid);
+                    ui.end_row();
+                });
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new("Playtime reflects the latest saved server stats.")
+                    .size(11.0)
+                    .color(theme::TEXT_MUTED),
+            );
+            ui.add_space(12.0);
+            theme::section_title_with_icon(ui, theme::icons::TERMINAL, "PLAYER CONTROLS");
+            ui.add_space(6.0);
+            if let Some(error) = &dialog.action_error {
+                ui.label(egui::RichText::new(error).color(theme::ERROR));
+            }
+            if let Some(notice) = &dialog.action_notice {
+                ui.label(egui::RichText::new(notice).color(theme::PRIMARY));
+            }
+            if let Some(error) = &management_error {
+                ui.label(egui::RichText::new(error).color(theme::ERROR));
+            }
+            if let Some(notice) = &management_notice {
+                ui.label(egui::RichText::new(notice).color(theme::PRIMARY));
+            }
+
+            let ip_ban_target = if dialog.is_online {
+                Some(dialog.name.clone())
+            } else {
+                player_ip.map(|ip| ip.to_string())
+            };
+            let ban_enabled = player_name_valid
+                && (server_running || (catalog_loaded && !management_pending));
+            ui.horizontal_wrapped(|ui| {
+                if dialog.is_online
+                    && ui
+                        .add_enabled(
+                            server_running && player_name_valid,
+                            theme::danger_button("Kick"),
+                        )
+                        .clicked()
+                {
+                    requested_action = Some(PlayerDetailsAction::SendCommand {
+                        command: format!("kick {}", dialog.name),
+                        notice: format!("Kick command sent for {}.", dialog.name),
+                        requires_online: true,
+                    });
+                }
+                let ban_button = if banned_uuid.is_some() {
+                    theme::secondary_button("Unban")
+                } else {
+                    theme::danger_button("Ban")
+                };
+                if ui.add_enabled(ban_enabled, ban_button).clicked() {
+                    requested_action = if server_running {
+                        Some(PlayerDetailsAction::SendCommand {
+                            command: if banned_uuid.is_some() {
+                                format!("pardon {}", dialog.name)
+                            } else {
+                                format!("ban {}", dialog.name)
+                            },
+                            notice: if banned_uuid.is_some() {
+                                format!("Unban command sent for {}.", dialog.name)
+                            } else {
+                                format!("Ban command sent for {}.", dialog.name)
+                            },
+                            requires_online: false,
+                        })
+                    } else if let Some(uuid) = &banned_uuid {
+                        Some(PlayerDetailsAction::RemovePlayerBan(uuid.clone()))
+                    } else {
+                        Some(PlayerDetailsAction::AddPlayerBan)
+                    };
+                }
+                let ip_button = if is_ip_banned {
+                    theme::secondary_button("IP Unban")
+                } else {
+                    theme::danger_button("IP Ban")
+                };
+                let ip_ban_enabled = if server_running {
+                    player_name_valid && (dialog.is_online || player_ip.is_some())
+                } else {
+                    catalog_loaded && !management_pending && player_ip.is_some()
+                };
+                if ui.add_enabled(ip_ban_enabled, ip_button).clicked() {
+                    let ip = player_ip.map(|ip| ip.to_string());
+                    requested_action = if is_ip_banned {
+                        ip.map(|ip| {
+                            if server_running {
+                                PlayerDetailsAction::SendCommand {
+                                    command: format!("pardon-ip {ip}"),
+                                    notice: format!("IP unban command sent for {ip}."),
+                                    requires_online: false,
+                                }
+                            } else {
+                                PlayerDetailsAction::RemoveIpBan(ip)
+                            }
+                        })
+                    } else if server_running {
+                        ip_ban_target.map(|target| PlayerDetailsAction::SendCommand {
+                            command: format!("ban-ip {target}"),
+                            notice: format!("IP ban command sent for {}.", dialog.name),
+                            requires_online: false,
+                        })
+                    } else {
+                        ip.map(PlayerDetailsAction::AddIpBan)
+                    };
+                }
+                if let Some(uuid) = &whitelist_uuid {
+                    if ui
+                        .add_enabled(
+                            !management_pending,
+                            theme::danger_button("Remove from whitelist"),
+                        )
+                        .clicked()
+                    {
+                        requested_action =
+                            Some(PlayerDetailsAction::RemoveFromWhitelist(uuid.clone()));
+                    }
+                } else if catalog_loaded {
+                    if ui
+                        .add_enabled(
+                            !management_pending && player_name_valid,
+                            theme::primary_button("Whitelist"),
+                        )
+                        .clicked()
+                    {
+                        requested_action = Some(PlayerDetailsAction::AddToWhitelist);
+                    }
+                } else {
+                    ui.add_enabled(false, theme::secondary_button("Whitelist"));
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "IP Ban uses the current IP for online players and the last known IP otherwise.",
+                )
+                .size(10.5)
+                .color(theme::TEXT_MUTED),
+            );
+            if dialog.is_online {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let input_width = (ui.available_width() - 90.0).max(120.0);
+                    ui.add_sized(
+                        [input_width, 34.0],
+                        egui::TextEdit::singleline(&mut dialog.message)
+                            .hint_text("Message this player"),
+                    );
+                    if ui
+                        .add_enabled(
+                            server_running
+                                && player_name_valid
+                                && !dialog.message.trim().is_empty(),
+                            theme::primary_button("Message"),
+                        )
+                        .clicked()
+                    {
+                        let message = dialog.message.trim().to_string();
+                        if message.chars().any(|character| matches!(character, '\r' | '\n')) {
+                            dialog.action_error =
+                                Some("Messages must be a single line.".to_string());
+                        } else {
+                            requested_action = Some(PlayerDetailsAction::SendCommand {
+                                command: format!("tell {} {message}", dialog.name),
+                                notice: format!("Message sent to {}.", dialog.name),
+                                requires_online: true,
+                            });
+                            dialog.message.clear();
+                        }
+                    }
+                });
+            }
+        });
+        if let Some(action) = requested_action {
+            self.apply_player_details_action(&mut dialog, action);
+        }
+        if modal.should_close() || close {
+            self.player_details = None;
+        } else {
+            self.player_details = Some(dialog);
+        }
+    }
+
+    fn apply_player_details_action(
+        &mut self,
+        dialog: &mut PlayerDetailsDialog,
+        action: PlayerDetailsAction,
+    ) {
+        dialog.action_error = None;
+        dialog.action_notice = None;
+        match action {
+            PlayerDetailsAction::SendCommand {
+                command,
+                notice,
+                requires_online,
+            } => {
+                let Some(entry) = self.servers.get_mut(dialog.server_index) else {
+                    dialog.action_error = Some("The server is no longer available.".to_string());
+                    return;
+                };
+                let is_online = entry
+                    .online_players
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(&dialog.name));
+                if requires_online && !is_online {
+                    dialog.is_online = false;
+                    dialog.action_error =
+                        Some("This action requires the player to be online.".to_string());
+                    return;
+                }
+                if !is_minecraft_username(&dialog.name) {
+                    dialog.action_error = Some("This player name is invalid.".to_string());
+                    return;
+                }
+                let Some(handle) = entry
+                    .handle
+                    .as_mut()
+                    .filter(|handle| handle.state() != ServerState::Stopped)
+                else {
+                    dialog.action_error =
+                        Some("Start the server before using player controls.".to_string());
+                    return;
+                };
+                handle.send_command(&command);
+                if command.starts_with("ban ")
+                    || command.starts_with("pardon ")
+                    || command.starts_with("ban-ip ")
+                    || command.starts_with("pardon-ip ")
+                {
+                    entry.player_management.last_refresh = None;
+                }
+                dialog.action_notice =
+                    Some(format!("{notice} Check the server console for result."));
+            }
+            PlayerDetailsAction::AddToWhitelist => {
+                let Some(entry) = self.servers.get_mut(dialog.server_index) else {
+                    dialog.action_error = Some("The server is no longer available.".to_string());
+                    return;
+                };
+                if entry.player_management.pending.is_some() {
+                    dialog.action_error =
+                        Some("Player data is updating. Try the action again shortly.".to_string());
+                    return;
+                }
+                entry.player_management.username = dialog.name.clone();
+                entry
+                    .player_management
+                    .add(entry.config.working_dir.clone());
+            }
+            PlayerDetailsAction::AddPlayerBan => {
+                let Some(entry) = self.servers.get_mut(dialog.server_index) else {
+                    dialog.action_error = Some("The server is no longer available.".to_string());
+                    return;
+                };
+                if entry
+                    .handle
+                    .as_ref()
+                    .is_some_and(|handle| handle.state() != ServerState::Stopped)
+                {
+                    dialog.action_error =
+                        Some("The server started; use the Ban command while it is running.".into());
+                    return;
+                }
+                if entry.player_management.pending.is_some() {
+                    dialog.action_error =
+                        Some("Player data is updating. Try the action again shortly.".to_string());
+                    return;
+                }
+                entry
+                    .player_management
+                    .ban_player(entry.config.working_dir.clone(), dialog.name.clone());
+            }
+            PlayerDetailsAction::RemovePlayerBan(uuid) => {
+                let Some(entry) = self.servers.get_mut(dialog.server_index) else {
+                    dialog.action_error = Some("The server is no longer available.".to_string());
+                    return;
+                };
+                if entry
+                    .handle
+                    .as_ref()
+                    .is_some_and(|handle| handle.state() != ServerState::Stopped)
+                {
+                    dialog.action_error =
+                        Some("The server started; use Unban while it is running.".into());
+                    return;
+                }
+                if entry.player_management.pending.is_some() {
+                    dialog.action_error =
+                        Some("Player data is updating. Try the action again shortly.".to_string());
+                    return;
+                }
+                entry
+                    .player_management
+                    .unban_player(entry.config.working_dir.clone(), uuid);
+            }
+            PlayerDetailsAction::AddIpBan(ip) => {
+                let Some(entry) = self.servers.get_mut(dialog.server_index) else {
+                    dialog.action_error = Some("The server is no longer available.".to_string());
+                    return;
+                };
+                if entry
+                    .handle
+                    .as_ref()
+                    .is_some_and(|handle| handle.state() != ServerState::Stopped)
+                {
+                    dialog.action_error =
+                        Some("The server started; use IP Ban while it is running.".into());
+                    return;
+                }
+                if entry.player_management.pending.is_some() {
+                    dialog.action_error =
+                        Some("Player data is updating. Try the action again shortly.".to_string());
+                    return;
+                }
+                entry
+                    .player_management
+                    .ban_ip(entry.config.working_dir.clone(), ip);
+            }
+            PlayerDetailsAction::RemoveIpBan(ip) => {
+                let Some(entry) = self.servers.get_mut(dialog.server_index) else {
+                    dialog.action_error = Some("The server is no longer available.".to_string());
+                    return;
+                };
+                if entry
+                    .handle
+                    .as_ref()
+                    .is_some_and(|handle| handle.state() != ServerState::Stopped)
+                {
+                    dialog.action_error =
+                        Some("The server started; use IP Unban while it is running.".into());
+                    return;
+                }
+                if entry.player_management.pending.is_some() {
+                    dialog.action_error =
+                        Some("Player data is updating. Try the action again shortly.".to_string());
+                    return;
+                }
+                entry
+                    .player_management
+                    .unban_ip(entry.config.working_dir.clone(), ip);
+            }
+            PlayerDetailsAction::RemoveFromWhitelist(uuid) => {
+                let Some(entry) = self.servers.get_mut(dialog.server_index) else {
+                    dialog.action_error = Some("The server is no longer available.".to_string());
+                    return;
+                };
+                if entry.player_management.pending.is_some() {
+                    dialog.action_error =
+                        Some("Player data is updating. Try the action again shortly.".to_string());
+                    return;
+                }
+                entry
+                    .player_management
+                    .remove(entry.config.working_dir.clone(), uuid);
+            }
+        }
+    }
+
+    fn ensure_player_skins(&mut self) {
+        let names = self
+            .player_skin_requests
+            .iter()
+            .take(MAX_PLAYER_SKINS_IN_FLIGHT)
+            .cloned()
+            .collect::<Vec<_>>();
+        for name in names {
+            self.player_skin_requests.remove(&name);
+            let key = name.to_ascii_lowercase();
+            if self.player_skin_textures.contains_key(&key)
+                || self.player_skin_pending.contains(&key)
+            {
+                continue;
+            }
+            if !is_minecraft_username(&name) {
+                self.player_skin_textures.insert(key, None);
+                continue;
+            }
+            self.player_skin_pending.insert(key.clone());
+            let tx = self.player_skin_tx.clone();
+            std::thread::spawn(move || {
+                let result = fetch_player_skin(&name);
+                let _ = tx.send((key, result));
+            });
+        }
+    }
+
+    fn poll_player_skins(&mut self, ctx: &egui::Context) {
+        for _ in 0..MAX_PLAYER_SKINS_IN_FLIGHT {
+            let (key, result) = match self.player_skin_rx.try_recv() {
+                Ok(result) => result,
+                Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
+            };
+            self.player_skin_pending.remove(&key);
+            let texture = match result {
+                Ok(bytes) => {
+                    let texture = load_player_skin_texture(ctx, &bytes, &key);
+                    if texture.is_none() {
+                        eprintln!("Could not decode player skin image for {key}.");
+                    }
+                    texture
+                }
+                Err(err) => {
+                    eprintln!("Could not download player skin for {key}: {err}");
+                    None
+                }
+            };
+            self.player_skin_textures.insert(key, texture);
+            ctx.request_repaint();
+        }
+        if !self.player_skin_pending.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(200));
         }
     }
 
@@ -4962,6 +6351,223 @@ fn load_logo(ctx: &egui::Context, bytes: &[u8], name: &str) -> Option<egui::Text
 /// Base URL of the MCJars S3 bucket that hosts per-software icons (lowercase names).
 const MCJARS_ICON_BASE: &str = "https://s3.mcjars.app/icons";
 
+fn load_player_skin_texture(
+    ctx: &egui::Context,
+    bytes: &[u8],
+    username: &str,
+) -> Option<egui::TextureHandle> {
+    let image = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let image = image::imageops::resize(&image, 64, 64, image::imageops::FilterType::Nearest);
+    let color = egui::ColorImage::from_rgba_unmultiplied([64, 64], image.as_raw());
+    Some(ctx.load_texture(
+        format!("player_skin_{username}"),
+        color,
+        egui::TextureOptions::NEAREST,
+    ))
+}
+
+fn player_detail_card(ui: &mut egui::Ui, glyph: &str, label: &str, value: &str) {
+    theme::card().show(ui, |ui| {
+        ui.set_width(220.0);
+        theme::section_title_with_icon(ui, glyph, label);
+        ui.add_space(6.0);
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(value)
+                    .size(14.0)
+                    .strong()
+                    .color(theme::TEXT),
+            )
+            .wrap(),
+        );
+    });
+}
+
+struct PlayerListPresentation<'a> {
+    status: &'a str,
+    status_color: egui::Color32,
+    empty_title: &'a str,
+    empty_hint: &'a str,
+    is_online: bool,
+}
+
+fn render_player_list(
+    ui: &mut egui::Ui,
+    players: &[String],
+    skin_textures: &HashMap<String, Option<egui::TextureHandle>>,
+    presentation: PlayerListPresentation<'_>,
+    selected_player: &mut Option<(String, bool)>,
+    visible_skin_requests: &mut Vec<String>,
+) {
+    if players.is_empty() {
+        render_player_list_empty(ui, presentation.empty_title, presentation.empty_hint);
+        return;
+    }
+
+    ui.spacing_mut().item_spacing.y = 8.0;
+    for name in players {
+        let skin_key = name.to_ascii_lowercase();
+        let response = theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                if let Some(Some(texture)) = skin_textures.get(&skin_key) {
+                    ui.add(egui::Image::new(texture).fit_to_exact_size(egui::vec2(40.0, 40.0)));
+                } else {
+                    ui.label(theme::icon(theme::icons::USERS, 22.0).color(theme::TEXT_MUTED));
+                }
+                ui.vertical(|ui| {
+                    ui.label(
+                        egui::RichText::new(name)
+                            .size(15.0)
+                            .strong()
+                            .color(theme::TEXT),
+                    );
+                    ui.label(
+                        egui::RichText::new(presentation.status)
+                            .size(10.0)
+                            .color(presentation.status_color),
+                    );
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(theme::ghost_icon_button(
+                            theme::icons::ARROW_RIGHT,
+                            "Details",
+                        ))
+                        .clicked()
+                    {
+                        *selected_player = Some((name.clone(), presentation.is_online));
+                    }
+                });
+            });
+        });
+        if ui.is_rect_visible(response.response.rect) && !skin_textures.contains_key(&skin_key) {
+            visible_skin_requests.push(name.clone());
+        }
+    }
+}
+
+fn render_player_list_empty(ui: &mut egui::Ui, title: &str, hint: &str) {
+    theme::card().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.add_space(12.0);
+        ui.vertical_centered(|ui| {
+            ui.label(theme::icon(theme::icons::USERS, 28.0).color(theme::TEXT_MUTED));
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(title)
+                    .size(16.0)
+                    .strong()
+                    .color(theme::TEXT),
+            );
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new(hint)
+                    .size(12.5)
+                    .color(theme::TEXT_MUTED),
+            );
+        });
+        ui.add_space(12.0);
+    });
+}
+
+fn render_player_list_loading(ui: &mut egui::Ui, loading: bool) {
+    theme::card().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.vertical_centered(|ui| {
+            if loading {
+                ui.spinner();
+                ui.label(
+                    egui::RichText::new("Loading server player data...").color(theme::TEXT_MUTED),
+                );
+            } else {
+                ui.label(
+                    egui::RichText::new("Player data is unavailable.").color(theme::TEXT_MUTED),
+                );
+            }
+        });
+    });
+}
+
+fn render_whitelist_row(
+    ui: &mut egui::Ui,
+    profile: &PlayerProfile,
+    skin_textures: &HashMap<String, Option<egui::TextureHandle>>,
+    can_remove: bool,
+    remove_player: &mut Option<String>,
+    visible_skin_requests: &mut Vec<String>,
+) {
+    let response = theme::card().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            let skin_key = profile.name.to_ascii_lowercase();
+            if let Some(Some(texture)) = skin_textures.get(&skin_key) {
+                ui.add(egui::Image::new(texture).fit_to_exact_size(egui::vec2(36.0, 36.0)));
+            } else {
+                ui.label(theme::icon(theme::icons::USERS, 20.0).color(theme::TEXT_MUTED));
+            }
+            ui.vertical(|ui| {
+                ui.label(
+                    egui::RichText::new(&profile.name)
+                        .size(14.5)
+                        .strong()
+                        .color(theme::TEXT),
+                );
+                ui.label(
+                    egui::RichText::new(&profile.uuid)
+                        .size(11.0)
+                        .color(theme::TEXT_MUTED),
+                );
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(
+                        can_remove,
+                        theme::danger_icon_button(theme::icons::TRASH, "Remove"),
+                    )
+                    .clicked()
+                {
+                    *remove_player = Some(profile.uuid.clone());
+                }
+            });
+        });
+    });
+    let skin_key = profile.name.to_ascii_lowercase();
+    if ui.is_rect_visible(response.response.rect) && !skin_textures.contains_key(&skin_key) {
+        visible_skin_requests.push(profile.name.clone());
+    }
+}
+
+fn render_ip_ban_row(
+    ui: &mut egui::Ui,
+    ip: &str,
+    can_remove: bool,
+    remove_ip: &mut Option<String>,
+) {
+    theme::card().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(ip)
+                    .size(14.5)
+                    .strong()
+                    .color(theme::TEXT),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(
+                        can_remove,
+                        theme::danger_icon_button(theme::icons::TRASH, "Unban"),
+                    )
+                    .clicked()
+                {
+                    *remove_ip = Some(ip.to_string());
+                }
+            });
+        });
+    });
+}
+
 /// Downloads one software icon from the MCJars S3 bucket.
 fn fetch_software_icon(software: &str) -> Result<Vec<u8>, String> {
     let client = reqwest::blocking::Client::builder()
@@ -5711,6 +7317,23 @@ fn update_online_players(players: &mut BTreeSet<String>, text: &str) {
     } else if let Some(name) = message.strip_suffix(" left the game") {
         players.remove(name.trim());
     }
+}
+
+fn parse_online_player_list(text: &str) -> Option<Vec<String>> {
+    let message = text.rsplit("]: ").next().unwrap_or(text).trim();
+    let (_, names) = message.split_once(" players online:")?;
+    let names = names.trim();
+    if names.is_empty() {
+        return Some(Vec::new());
+    }
+    Some(
+        names
+            .split(',')
+            .map(str::trim)
+            .filter(|name| is_minecraft_username(name))
+            .map(str::to_string)
+            .collect(),
+    )
 }
 
 /// Reads `max-players` from a server's server.properties (default 20).
@@ -6776,7 +8399,8 @@ fn install_server_version(
 #[cfg(test)]
 mod tests {
     use super::{
-        file_path_breadcrumbs, format_duration, sidebar_footer_height, update_online_players,
+        file_path_breadcrumbs, format_duration, parse_online_player_list, sidebar_footer_height,
+        update_online_players,
     };
     use std::collections::BTreeSet;
     use std::path::Path;
@@ -6839,6 +8463,26 @@ mod tests {
 
         update_online_players(&mut players, "[Server thread/INFO]: Alex left the game");
         assert_eq!(players.iter().cloned().collect::<Vec<_>>(), ["Sam"]);
+    }
+
+    #[test]
+    fn player_list_command_reconciles_current_players() {
+        assert_eq!(
+            parse_online_player_list(
+                "[Server thread/INFO]: There are 2 of a max of 20 players online: Alex, Sam"
+            ),
+            Some(vec!["Alex".to_string(), "Sam".to_string()])
+        );
+        assert_eq!(
+            parse_online_player_list(
+                "[Server thread/INFO]: There are 0 of a max of 20 players online:"
+            ),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            parse_online_player_list("[Server thread/INFO]: Alex joined the game"),
+            None
+        );
     }
 
     #[test]

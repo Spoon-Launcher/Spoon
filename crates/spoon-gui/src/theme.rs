@@ -290,6 +290,9 @@ pub mod icons {
     pub const MEMORY: &str = "\u{f538}";
     pub const CLOCK: &str = "\u{f017}";
     pub const USERS: &str = "\u{f0c0}";
+    pub const LOCATION_DOT: &str = "\u{f3c5}";
+    pub const GLOBE: &str = "\u{f0ac}";
+    pub const FINGERPRINT: &str = "\u{f577}";
     pub const COMMENTS: &str = "\u{f086}";
     pub const SERVER: &str = "\u{f233}";
     pub const TERMINAL: &str = "\u{f120}";
@@ -443,13 +446,15 @@ pub fn status_pill(ui: &mut egui::Ui, text: &str, color: Color32) {
     egui::Frame::new()
         .fill(color.gamma_multiply(0.16))
         .corner_radius(egui::CornerRadius::same(255))
-        .inner_margin(egui::Margin::symmetric(10, 3))
+        .inner_margin(egui::Margin::symmetric(6, 2))
         .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new(format!("{}  {text}", "\u{25CF}"))
-                    .color(color)
-                    .size(13.0),
-            );
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                let (dot_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover());
+                ui.painter().circle_filled(dot_rect.center(), 3.0, color);
+                ui.label(egui::RichText::new(text).color(color).size(12.0));
+            });
         });
 }
 

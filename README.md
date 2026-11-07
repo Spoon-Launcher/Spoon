@@ -21,6 +21,7 @@ Join the [Discord](https://discord.gg/7UEZnsMMkf) for updates and to talk with t
 - **Use a live console** — view colorized output, send commands, search and filter the console, and
   browse command history.
 - **Monitor activity** — check CPU and memory usage, uptime, online players, and the server IP.
+- **Manage players** — browse live online and offline player lists
 - **Work with server files** — browse and edit files without leaving Spoon.
 - **Back up server files** — snapshot a server's folder into Spoon's backups
   directory and restore a snapshot later.

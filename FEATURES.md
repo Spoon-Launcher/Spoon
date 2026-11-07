@@ -48,7 +48,7 @@ Status: ✅ Done · 🟡 In Progress · ⬜ Planned
 - ⬜ Desktop notifications (server up / down)
 - ⬜ Modrinth/Spigot Plugin Installer
 - ⬜ Modrinth/Curseforge Mod Installer
-- ⬜ Player Management
+- ✅ Player Management
 - ✅ File Browser / File editor / Open server folder
 - ✅ Private Java runtimes
 - ⬜ Playit.gg Tunnel Support
