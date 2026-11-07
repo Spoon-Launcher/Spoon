@@ -21,8 +21,8 @@ use spoon_core::players::{
 };
 use spoon_core::updater::{updates_dir, UpdateClient, UpdateInfo};
 use spoon_core::{
-    new_id, unique_server_dir, AppSettings, LogLine, ServerConfig, ServerHandle, ServerState,
-    ServerStore,
+    new_id, next_available_port, unique_server_dir, write_server_properties, AppSettings, LogLine,
+    ServerConfig, ServerHandle, ServerState, ServerStore, DEFAULT_SERVER_PORT,
 };
 
 use crate::theme;
@@ -42,10 +42,108 @@ const MAX_ICONS_PER_FRAME: usize = 4;
 const MAX_PLAYER_SKINS_IN_FLIGHT: usize = 4;
 const PLAYER_MANAGEMENT_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const BACKUP_STATUS_DURATION: Duration = Duration::from_secs(4);
+/// Width of the dashboard icon rail: two 8px paddings, a 36px button and the border.
+const RAIL_STRIP_WIDTH: f32 = 8.0 + 36.0 + 8.0 + 2.0;
+/// The dashboard pages in rail order: page, icon glyph, hover label.
+const RAIL_PAGES: [(ServerPage, &str, &str); 5] = [
+    (ServerPage::Overview, theme::icons::GAUGE_HIGH, "Overview"),
+    (ServerPage::Files, theme::icons::FOLDER, "Files"),
+    (ServerPage::Players, theme::icons::USERS, "Players"),
+    (ServerPage::Backups, theme::icons::ARCHIVE, "Backups"),
+    (ServerPage::Settings, theme::icons::GEAR, "Settings"),
+];
 
 /// Result of one software icon download: the lowercase software name plus the raw PNG bytes.
 type IconFetch = (String, Result<Vec<u8>, String>);
 type PlayerSkinFetch = (String, Result<Vec<u8>, String>);
+
+#[derive(Clone, Copy)]
+enum SocialButtonIcon {
+    Discord,
+    Coffee,
+}
+
+fn social_link_button(
+    ui: &mut egui::Ui,
+    width: f32,
+    label: &str,
+    hover_text: &str,
+    fill: egui::Color32,
+    icon: SocialButtonIcon,
+) -> bool {
+    let response = ui
+        .add_sized(
+            [width, 32.0],
+            theme::animated_button(
+                egui::Button::new(""),
+                fill,
+                fill.linear_multiply(1.1),
+                egui::Stroke::NONE,
+                egui::Stroke::NONE,
+            ),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(hover_text);
+    let rect = response.rect;
+    let painter = ui.painter();
+    let text = painter.layout_no_wrap(
+        label.to_owned(),
+        egui::FontId::proportional(12.5),
+        egui::Color32::WHITE,
+    );
+    let icon_size = egui::vec2(18.0, 16.0);
+    let gap = 4.0;
+    let content_width = icon_size.x + gap + text.size().x;
+    let content_left = rect.center().x - content_width * 0.5;
+    let icon_rect = egui::Rect::from_min_size(
+        egui::pos2(content_left, rect.center().y - icon_size.y * 0.5),
+        icon_size,
+    );
+
+    match icon {
+        SocialButtonIcon::Discord => {
+            painter.rect_filled(icon_rect, egui::CornerRadius::same(6), egui::Color32::WHITE);
+            let cutout = fill;
+            painter.circle_filled(
+                egui::pos2(icon_rect.left() + 6.0, icon_rect.center().y - 1.0),
+                1.2,
+                cutout,
+            );
+            painter.circle_filled(
+                egui::pos2(icon_rect.right() - 6.0, icon_rect.center().y - 1.0),
+                1.2,
+                cutout,
+            );
+            painter.add(egui::Shape::line(
+                vec![
+                    egui::pos2(icon_rect.left() + 5.0, icon_rect.center().y + 3.0),
+                    egui::pos2(icon_rect.center().x, icon_rect.center().y + 4.0),
+                    egui::pos2(icon_rect.right() - 5.0, icon_rect.center().y + 3.0),
+                ],
+                egui::Stroke::new(1.2_f32, cutout),
+            ));
+        }
+        SocialButtonIcon::Coffee => {
+            painter.text(
+                icon_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                theme::icons::COFFEE,
+                egui::FontId::new(15.0, theme::icon_family()),
+                egui::Color32::WHITE,
+            );
+        }
+    }
+
+    painter.galley(
+        egui::pos2(
+            content_left + icon_size.x + gap,
+            rect.center().y - text.size().y * 0.5,
+        ),
+        text,
+        egui::Color32::WHITE,
+    );
+    response.clicked()
+}
 
 /// The MCJars software and version catalog, loaded at launch and refreshed in
 /// the background so the pickers never wait on the network.
@@ -730,7 +828,7 @@ pub struct SpoonApp {
     page: ServerPage,
     /// Sidebar search box filtering servers by name.
     sidebar_filter: String,
-    add_dialog: Option<AddDialog>,
+    create_page: Option<CreatePage>,
     import_dialog: Option<ImportDialog>,
     settings_dialog: Option<SettingsDialog>,
     files_dialog: Option<FilesDialog>,
@@ -848,7 +946,7 @@ impl SpoonApp {
             selected,
             page: ServerPage::Overview,
             sidebar_filter: String::new(),
-            add_dialog: None,
+            create_page: None,
             import_dialog: None,
             settings_dialog: None,
             files_dialog: None,
@@ -906,6 +1004,24 @@ impl SpoonApp {
         self.files_dialog = None;
         self.backups_dialog = None;
         self.version_modal = None;
+    }
+
+    /// Opens the full-page server creation flow, suggesting the first free
+    /// port (25565 and up) not taken by another Spoon server. A page with an
+    /// in-flight download is left alone.
+    fn open_create_page(&mut self) {
+        if self
+            .create_page
+            .as_ref()
+            .is_some_and(CreatePage::is_downloading)
+        {
+            return;
+        }
+        let assigned: Vec<u16> = self.servers.iter().map(|e| e.config.server_port).collect();
+        self.create_page = Some(CreatePage::new(next_available_port(
+            DEFAULT_SERVER_PORT,
+            &assigned,
+        )));
     }
 
     /// Switches the sub-navigation page, creating the page state on first
@@ -1508,7 +1624,6 @@ impl eframe::App for SpoonApp {
 
         self.render_sidebar(ctx);
         self.render_main_panel(ctx);
-        self.render_add_dialog(ctx);
         self.render_import_dialog(ctx);
         self.render_remove_confirm(ctx);
         self.render_update_dialog(ctx);
@@ -1585,28 +1700,31 @@ impl SpoonApp {
                     );
                 });
                 ui.add_space(8.0);
-                if ui
-                    .add_sized(
-                        [ui.available_width(), 36.0],
-                        theme::animated_button(
-                            egui::Button::new(theme::icon_text_job(
-                                theme::icons::COMMENTS,
-                                "Join Discord",
-                                egui::Color32::WHITE,
-                            )),
-                            DISCORD_BUTTON_COLOR,
-                            DISCORD_BUTTON_COLOR.linear_multiply(1.1),
-                            egui::Stroke::NONE,
-                            egui::Stroke::NONE,
-                        ),
-                    )
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .on_hover_text("Join the Spoon community on Discord")
-                    .clicked()
-                {
-                    ui.ctx()
-                        .open_url(egui::OpenUrl::new_tab(DISCORD_INVITE_URL));
-                }
+                ui.horizontal(|ui| {
+                    let button_width =
+                        ((ui.available_width() - ui.spacing().item_spacing.x) * 0.5).max(0.0);
+                    if social_link_button(
+                        ui,
+                        button_width,
+                        "Discord",
+                        "Join the Spoon community on Discord",
+                        DISCORD_BUTTON_COLOR,
+                        SocialButtonIcon::Discord,
+                    ) {
+                        ui.ctx()
+                            .open_url(egui::OpenUrl::new_tab(DISCORD_INVITE_URL));
+                    }
+                    if social_link_button(
+                        ui,
+                        button_width,
+                        "Ko-fi",
+                        "Support Spoon on Ko-fi",
+                        KOFI_BUTTON_COLOR,
+                        SocialButtonIcon::Coffee,
+                    ) {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(KOFI_URL));
+                    }
+                });
                 ui.add_space(10.0);
                 // Header: "Servers" + count, with start/stop-all shortcuts.
                 let server_count = self.servers.len();
@@ -1772,7 +1890,16 @@ impl SpoonApp {
                     });
 
                 if let Some(i) = select {
-                    self.select_server(i);
+                    // Switching to a server dismisses the create page; an
+                    // in-flight download must not be discarded.
+                    if !self
+                        .create_page
+                        .as_ref()
+                        .is_some_and(CreatePage::is_downloading)
+                    {
+                        self.create_page = None;
+                        self.select_server(i);
+                    }
                 }
                 if let Some(i) = rename {
                     self.select_server(i);
@@ -1830,7 +1957,7 @@ impl SpoonApp {
                         )
                         .clicked()
                     {
-                        self.add_dialog = Some(AddDialog::new());
+                        self.open_create_page();
                     }
                     // The update row: an available update opens the dialog; a
                     // downloaded one restarts straight into it and stays here
@@ -1905,7 +2032,7 @@ impl SpoonApp {
                         .add(theme::primary_icon_button(theme::icons::PLUS, "Add Server"))
                         .clicked()
                     {
-                        self.add_dialog = Some(AddDialog::new());
+                        self.open_create_page();
                     }
                     if ui
                         .add(theme::ghost_icon_button(
@@ -1929,6 +2056,10 @@ impl SpoonApp {
                     .inner_margin(egui::Margin::same(18)),
             )
             .show(ctx, |ui| {
+                if self.create_page.is_some() {
+                    self.render_create_page(ui);
+                    return;
+                }
                 let Some(index) = self.selected else {
                     self.render_empty_state(ui);
                     return;
@@ -2065,40 +2196,79 @@ impl SpoonApp {
                 });
                 ui.add_space(8.0);
 
-                // Dashboard page tabs.
+                // Dashboard pages: a slim icon rail on the left and the page
+                // content filling the remaining width.
+                let content_height = ui.available_height();
                 ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    let settings_blocked = !can_edit_settings;
-                    for (page, glyph, label) in [
-                        (ServerPage::Overview, theme::icons::SLIDERS, "Overview"),
-                        (ServerPage::Files, theme::icons::FOLDER, "Files"),
-                        (ServerPage::Players, theme::icons::USERS, "Players"),
-                        (ServerPage::Backups, theme::icons::ARCHIVE, "Backups"),
-                        (ServerPage::Settings, theme::icons::GEAR, "Settings"),
-                    ] {
-                        let active = self.page == page;
-                        let blocked = page == ServerPage::Settings && settings_blocked;
-                        let response = if blocked {
-                            ui.add_enabled(false, theme::nav_tab(active, glyph, label))
-                                .on_hover_text("Finish the version change first")
-                        } else {
-                            ui.add(theme::nav_tab(active, glyph, label))
-                        };
-                        if response.clicked() {
-                            self.select_page(page, index);
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    self.render_page_rail(ui, index, can_edit_settings, content_height);
+                    ui.vertical(|ui| {
+                        ui.set_width(ui.available_width());
+                        match self.page {
+                            ServerPage::Overview => self.render_overview_page(ui, index),
+                            ServerPage::Players => self.render_players_page(ui, index),
+                            ServerPage::Files => self.render_files_page(ui, index),
+                            ServerPage::Backups => self.render_backups_page(ui, index),
+                            ServerPage::Settings => self.render_settings_page(ui, index),
                         }
-                    }
+                    });
                 });
-                ui.add_space(10.0);
-
-                match self.page {
-                    ServerPage::Overview => self.render_overview_page(ui, index),
-                    ServerPage::Players => self.render_players_page(ui, index),
-                    ServerPage::Files => self.render_files_page(ui, index),
-                    ServerPage::Backups => self.render_backups_page(ui, index),
-                    ServerPage::Settings => self.render_settings_page(ui, index),
-                }
             });
+    }
+
+    /// The slim left-hand navigation rail for the dashboard pages: one
+    /// icon-only button per page, with the page name in the hover tooltip.
+    /// The buttons form a compact card, vertically centered next to the page
+    /// content, that spreads out as pages are added.
+    fn render_page_rail(
+        &mut self,
+        ui: &mut egui::Ui,
+        index: usize,
+        can_edit_settings: bool,
+        height: f32,
+    ) {
+        // Reserve a slim, full-height strip so the page content next to the
+        // rail keeps its height, then paint a content-sized card centered
+        // inside the strip and lay the buttons out within it. (Allocating
+        // first and building a child ui mirrors how egui implements
+        // SidePanel; a frame shown inside a horizontal row would otherwise
+        // size to its content.)
+        let (strip, _) =
+            ui.allocate_exact_size(egui::vec2(RAIL_STRIP_WIDTH, height), egui::Sense::hover());
+        let card_height = (RAIL_PAGES.len() as f32 * 36.0
+            + (RAIL_PAGES.len() as f32 - 1.0) * 6.0
+            + 2.0 * (10.0 + 1.0))
+            .min(height);
+        let card_rect =
+            egui::Rect::from_center_size(strip.center(), egui::vec2(RAIL_STRIP_WIDTH, card_height));
+        let frame = egui::Frame::new()
+            .fill(theme::SURFACE)
+            .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
+            .corner_radius(egui::CornerRadius::same(10))
+            .inner_margin(egui::Margin::symmetric(8, 10));
+        let content_rect = card_rect - frame.total_margin();
+        ui.painter().add(frame.paint(content_rect));
+        let mut rail_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(content_rect)
+                .layout(egui::Layout::top_down(egui::Align::Center)),
+        );
+        rail_ui.spacing_mut().item_spacing.y = 6.0;
+        for &(page, glyph, label) in &RAIL_PAGES {
+            let active = self.page == page;
+            let response = if page == ServerPage::Settings && !can_edit_settings {
+                rail_ui
+                    .add_enabled(false, theme::nav_icon_tab(active, glyph))
+                    .on_hover_text("Finish the version change first")
+            } else {
+                rail_ui
+                    .add(theme::nav_icon_tab(active, glyph))
+                    .on_hover_text(label)
+            };
+            if response.clicked() {
+                self.select_page(page, index);
+            }
+        }
     }
 
     /// Overview page: the server address, the EULA banner, live stat cards,
@@ -3613,120 +3783,412 @@ impl SpoonApp {
         }
     }
 
-    fn render_add_dialog(&mut self, ctx: &egui::Context) {
-        if self.add_dialog.is_none() {
+    /// The full-page server creation flow, rendered in the main panel while
+    /// `self.create_page` is open.
+    fn render_create_page(&mut self, ui: &mut egui::Ui) {
+        if self.create_page.is_none() {
             return;
         }
         let mut cancel = false;
         let mut create_clicked = false;
-        let modal = egui::Modal::new(egui::Id::new("add_server_dialog"))
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::SURFACE)
-                    .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
-                    .corner_radius(egui::CornerRadius::same(12))
-                    .inner_margin(egui::Margin::same(20)),
-            )
-            .backdrop_color(egui::Color32::from_black_alpha(140))
-            .show(ctx, |ui| {
-                ui.set_width(460.0);
-                ui.label(theme::title_with_icon(
-                    theme::icons::PLUS,
-                    "Add Server",
-                    theme::PRIMARY,
-                ));
-                ui.add_space(2.0);
-                ui.label(
-                    egui::RichText::new("Download and configure a new Minecraft server.")
-                        .size(13.0)
-                        .color(theme::TEXT_MUTED),
-                );
-                ui.add_space(14.0);
-                let dialog = self.add_dialog.as_mut().unwrap();
-                dialog.poll();
-                dialog.ui(ui, &self.software, &self.icon_textures);
-                ui.add_space(14.0);
-                ui.horizontal(|ui| {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let downloading = dialog.is_downloading();
-                        if downloading {
-                            ui.add_enabled(false, theme::primary_button("  Creating…  "));
-                        } else if ui
-                            .add(theme::primary_icon_button(theme::icons::CHECK, "Create"))
-                            .clicked()
-                        {
-                            create_clicked = true;
-                        }
-                        if ui
-                            .add_enabled(
-                                !downloading,
-                                theme::ghost_icon_button(theme::icons::XMARK, "Cancel"),
-                            )
-                            .clicked()
-                        {
-                            cancel = true;
-                        }
-                    });
+
+        ui.spacing_mut().item_spacing.y = 8.0;
+        ui.label(theme::title_with_icon(
+            theme::icons::PLUS,
+            "Create Server",
+            theme::PRIMARY,
+        ));
+        ui.label(
+            egui::RichText::new("Download and configure a new Minecraft server.")
+                .size(13.0)
+                .color(theme::TEXT_MUTED),
+        );
+
+        let page = self.create_page.as_ref().unwrap();
+        let footer_height = 48.0
+            + if page.pending.is_some() { 32.0 } else { 0.0 }
+            + if page.error.is_some() { 28.0 } else { 0.0 };
+        // The gap lives outside the scroll area: inside, the columns fill the
+        // whole body height, so any extra pixel would make the page scroll.
+        ui.add_space(6.0);
+        let body_height = (ui.available_height() - footer_height).max(0.0);
+        show_create_page_scroll_area(ui, footer_height, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 12.0;
+                // The first child of a horizontal row only sees the row's
+                // current (small) height; grow the cursor up front so the
+                // left column's lists can fill the computed body height.
+                let _ = ui.allocate_exact_size(egui::vec2(0.0, body_height), egui::Sense::hover());
+                // Left: software and version pickers.
+                ui.vertical(|ui| {
+                    ui.set_width((ui.available_width() * 0.48).clamp(280.0, 430.0));
+                    self.render_create_software_column(ui);
+                });
+                // Right: configuration form.
+                ui.vertical(|ui| {
+                    ui.set_width(ui.available_width());
+                    self.render_create_settings_form(ui);
                 });
             });
+        });
 
-        // Don't let a backdrop click or Esc discard an in-flight download.
-        if modal.should_close()
-            && !self
-                .add_dialog
-                .as_ref()
-                .is_some_and(AddDialog::is_downloading)
-        {
-            self.add_dialog = None;
+        let page = self.create_page.as_mut().unwrap();
+        if let Some(pending) = &page.pending {
+            ui.add_space(6.0);
+            let fraction = if pending.total > 0 {
+                (pending.downloaded as f32 / pending.total as f32).min(1.0)
+            } else {
+                0.0
+            };
+            ui.add(egui::ProgressBar::new(fraction).text(format!(
+                "Downloading {} / {}",
+                format_mb(pending.downloaded),
+                format_mb(pending.total)
+            )));
+        }
+        if let Some(err) = &page.error {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(err).color(theme::ERROR));
         }
 
-        if self
-            .add_dialog
-            .as_ref()
-            .is_some_and(AddDialog::is_downloading)
-        {
+        ui.add_space(6.0);
+        let downloading = page.is_downloading();
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if downloading {
+                    ui.add_enabled(false, theme::primary_button("  Creating…  "));
+                } else if ui
+                    .add(theme::primary_icon_button(
+                        theme::icons::CHECK,
+                        "Create Server",
+                    ))
+                    .clicked()
+                {
+                    create_clicked = true;
+                }
+                if ui
+                    .add_enabled(
+                        !downloading,
+                        theme::ghost_icon_button(theme::icons::XMARK, "Cancel"),
+                    )
+                    .clicked()
+                {
+                    cancel = true;
+                }
+            });
+        });
+
+        // Esc discards the page like the cancel button; an in-flight download
+        // must not be interrupted.
+        if !downloading && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancel = true;
+        }
+        if downloading {
             // Keep refreshing while the download is in flight.
-            ctx.request_repaint();
+            ui.ctx().request_repaint();
         }
+        page.poll();
 
         if create_clicked {
             let servers_root = self.store.servers_dir();
-            self.add_dialog
-                .as_mut()
-                .unwrap()
-                .start_create(&servers_root);
+            let assigned: Vec<u16> = self.servers.iter().map(|e| e.config.server_port).collect();
+            let page = self.create_page.as_mut().unwrap();
+            page.start_create(&servers_root, &assigned);
         }
 
-        let finished = self.add_dialog.as_mut().and_then(AddDialog::take_finished);
-        if let Some((pending, result)) = finished {
+        let finished = self
+            .create_page
+            .as_mut()
+            .and_then(CreatePage::take_finished);
+        if let Some((config, result)) = finished {
             match result {
                 Ok(()) => {
-                    let mut config = ServerConfig::new(
-                        pending.id,
-                        pending.name,
-                        pending.dir.join("server.jar"),
-                        pending.dir,
-                        pending.max_memory_mb,
-                    );
-                    config.jvm_args = pending.jvm_args;
-                    config.server_type = Some(pending.server_type);
-                    config.server_version = Some(pending.server_version);
                     self.servers.push(ServerEntry::new(config));
                     self.select_server(self.servers.len() - 1);
                     self.save();
-                    self.add_dialog = None;
+                    self.create_page = None;
                 }
                 Err(err) => {
-                    let dialog = self.add_dialog.as_mut().unwrap();
-                    dialog.pending = None;
-                    dialog.error = Some(err);
+                    let page = self.create_page.as_mut().unwrap();
+                    page.pending = None;
+                    page.error = Some(err);
                 }
             }
         }
 
-        if cancel {
-            self.add_dialog = None;
+        if cancel
+            && !self
+                .create_page
+                .as_ref()
+                .is_some_and(CreatePage::is_downloading)
+        {
+            self.create_page = None;
         }
+    }
+
+    /// Left column of the create page: searchable software list and, below it,
+    /// the searchable version list for the selected software. Both lists share
+    /// the column height so the cards fill the page instead of a fixed slice.
+    fn render_create_software_column(&mut self, ui: &mut egui::Ui) {
+        let page = self.create_page.as_mut().unwrap();
+        // Pick the newest build once the version list for the preselected
+        // software has loaded.
+        if page.selected_version.is_none() {
+            if let Some(server_type) = &page.selected_type {
+                page.selected_version = self
+                    .software
+                    .versions(server_type)
+                    .last()
+                    .map(|version| version.id.clone());
+            }
+        }
+
+        // Each card spends roughly this much on its title, search field, gaps
+        // and margins. The software list takes about half of the column; the
+        // version list is measured inside its own card (below), so it always
+        // fills whatever height the software card actually left behind.
+        const CARD_CHROME: f32 = 101.0;
+        const GAP: f32 = 10.0;
+        let software_list_height = ((ui.available_height() - GAP) * 0.5 - CARD_CHROME).max(80.0);
+
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            theme::section_title_with_icon(ui, theme::icons::SERVER, "SERVER SOFTWARE");
+            ui.add_space(6.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut page.software_filter)
+                    .id(egui::Id::new("create_software_filter"))
+                    .desired_width(f32::INFINITY)
+                    .hint_text("Search software…"),
+            );
+            ui.add_space(6.0);
+            let filter = page.software_filter.trim().to_lowercase();
+            egui::ScrollArea::vertical()
+                .id_salt("create_software_list")
+                .auto_shrink([false, false])
+                .hscroll(false)
+                .max_height(software_list_height)
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    let Some(snapshot) = &self.software.snapshot else {
+                        if self.software.is_loading() {
+                            ui.label("Loading server software…");
+                        } else {
+                            let message = self
+                                .software
+                                .error
+                                .as_deref()
+                                .unwrap_or("Failed to load server software.");
+                            ui.label(egui::RichText::new(message).color(theme::ERROR));
+                        }
+                        return;
+                    };
+                    let mut clicked = None;
+                    let mut matched = 0usize;
+                    for (server_type, info) in snapshot.types.all() {
+                        if !filter.is_empty() && !info.name.to_lowercase().contains(&filter) {
+                            continue;
+                        }
+                        matched += 1;
+                        let key = server_type.api_name().to_lowercase();
+                        if software_row(
+                            &self.icon_textures,
+                            ui,
+                            &key,
+                            &info.name,
+                            page.selected_type.as_ref() == Some(server_type),
+                        ) {
+                            clicked = Some(server_type.clone());
+                        }
+                    }
+                    if matched == 0 {
+                        ui.label(
+                            egui::RichText::new("No software found.").color(theme::TEXT_MUTED),
+                        );
+                    }
+                    if let Some(server_type) = clicked {
+                        page.selected_version = self
+                            .software
+                            .versions(&server_type)
+                            .last()
+                            .map(|version| version.id.clone());
+                        page.selected_type = Some(server_type);
+                    }
+                });
+        });
+        ui.add_space(GAP);
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            theme::section_title_with_icon(ui, theme::icons::TAG, "VERSION");
+            ui.add_space(6.0);
+            ui.add(
+                egui::TextEdit::singleline(&mut page.version_filter)
+                    .id(egui::Id::new("create_version_filter"))
+                    .desired_width(f32::INFINITY)
+                    .hint_text("Search versions…"),
+            );
+            ui.add_space(6.0);
+            // Measured here, after the card chrome: this is exactly the
+            // height the scroll area can occupy below, so the card always
+            // reaches the bottom of the column.
+            let version_list_height = ui.available_height().max(80.0);
+            let filter = page.version_filter.trim().to_lowercase();
+            egui::ScrollArea::vertical()
+                .id_salt("create_version_list")
+                .auto_shrink([false, false])
+                .hscroll(false)
+                .max_height(version_list_height)
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    let Some(server_type) = page.selected_type.as_ref() else {
+                        ui.label(
+                            egui::RichText::new("Select a software first.")
+                                .color(theme::TEXT_MUTED),
+                        );
+                        return;
+                    };
+                    let versions = self.software.versions(server_type);
+                    if versions.is_empty() {
+                        ui.label("No versions found.");
+                        return;
+                    }
+                    let latest = versions.last().map(|version| version.id.clone());
+                    let mut matched = 0usize;
+                    for version in versions.iter().rev() {
+                        if !filter.is_empty() && !version.id.to_lowercase().contains(&filter) {
+                            continue;
+                        }
+                        matched += 1;
+                        let selected = page.selected_version.as_ref() == Some(&version.id);
+                        if version_row(
+                            ui,
+                            &version.id,
+                            selected,
+                            latest.as_ref() == Some(&version.id),
+                        ) {
+                            page.selected_version = Some(version.id.clone());
+                        }
+                    }
+                    if matched == 0 {
+                        ui.label(
+                            egui::RichText::new("No versions match your search.")
+                                .color(theme::TEXT_MUTED),
+                        );
+                    }
+                });
+        });
+    }
+
+    /// Right column of the create page: the server configuration form.
+    fn render_create_settings_form(&mut self, ui: &mut egui::Ui) {
+        let page = self.create_page.as_mut().unwrap();
+
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            theme::section_title_with_icon(ui, theme::icons::SLIDERS, "GENERAL");
+            ui.add_space(6.0);
+            form_label(ui, "Server name");
+            ui.add(egui::TextEdit::singleline(&mut page.name).desired_width(f32::INFINITY));
+            ui.add_space(10.0);
+            memory_stepper(ui, "Memory (max)", &mut page.max_memory_mb, 512, 65536);
+            ui.add_space(10.0);
+            form_label(ui, "JVM arguments (optional)");
+            ui.add(
+                egui::TextEdit::singleline(&mut page.jvm_args)
+                    .id(egui::Id::new("create_jvm_args"))
+                    .desired_width(f32::INFINITY)
+                    .hint_text("-XX:+UseG1GC"),
+            );
+        });
+        ui.add_space(10.0);
+
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            theme::section_title_with_icon(ui, theme::icons::GLOBE, "WORLD");
+            ui.add_space(6.0);
+            settings_combo(
+                ui,
+                "create_gamemode",
+                "Gamemode",
+                &GAMEMODE_OPTIONS,
+                &mut page.gamemode,
+            );
+            ui.add_space(8.0);
+            settings_combo(
+                ui,
+                "create_difficulty",
+                "Difficulty",
+                &DIFFICULTY_OPTIONS,
+                &mut page.difficulty,
+            );
+            ui.add_space(8.0);
+            settings_combo(
+                ui,
+                "create_level_type",
+                "Level type",
+                &LEVEL_TYPE_OPTIONS,
+                &mut page.level_type,
+            );
+            ui.add_space(8.0);
+            form_label(ui, "Level seed (optional)");
+            ui.add(
+                egui::TextEdit::singleline(&mut page.level_seed)
+                    .id(egui::Id::new("create_level_seed"))
+                    .desired_width(f32::INFINITY)
+                    .hint_text("Random when empty"),
+            );
+            ui.add_space(10.0);
+            form_label(ui, "Max players");
+            ui.add(
+                egui::DragValue::new(&mut page.max_players)
+                    .range(1..=1000)
+                    .speed(1),
+            );
+        });
+        ui.add_space(10.0);
+
+        theme::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            theme::section_title_with_icon(ui, theme::icons::LOCATION_DOT, "NETWORK");
+            ui.add_space(6.0);
+            form_label(ui, "Server port");
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::DragValue::new(&mut page.server_port)
+                        .range(1..=65535)
+                        .speed(1),
+                );
+                let assigned: Vec<u16> =
+                    self.servers.iter().map(|e| e.config.server_port).collect();
+                if assigned.contains(&page.server_port) {
+                    ui.label(
+                        egui::RichText::new("Already used by another Spoon server")
+                            .size(12.0)
+                            .color(theme::WARN),
+                    );
+                } else if !spoon_core::port::is_port_available(page.server_port) {
+                    ui.label(
+                        egui::RichText::new("Port is in use")
+                            .size(12.0)
+                            .color(theme::WARN),
+                    );
+                }
+            });
+            ui.add_space(10.0);
+            settings_toggle(
+                ui,
+                &mut page.online_mode,
+                "Online Mode",
+                "Verify that players own the game",
+            );
+            ui.add_space(8.0);
+            settings_toggle(
+                ui,
+                &mut page.use_whitelist,
+                "Use Whitelist",
+                "Only allow listed players to join",
+            );
+        });
     }
 
     fn render_import_dialog(&mut self, ctx: &egui::Context) {
@@ -6307,6 +6769,8 @@ const LOGO_PNG: &[u8] = include_bytes!("../../../assets/images/Spoon-No-Border.p
 const LOGO_HOVER_PNG: &[u8] = include_bytes!("../../../assets/images/Spoon-Hover.png");
 const DISCORD_INVITE_URL: &str = "https://discord.gg/7UEZnsMMkf";
 const DISCORD_BUTTON_COLOR: egui::Color32 = egui::Color32::from_rgb(88, 101, 242);
+const KOFI_URL: &str = "https://ko-fi.com/pengucc";
+const KOFI_BUTTON_COLOR: egui::Color32 = egui::Color32::from_rgb(0xFF, 0x5E, 0x5B);
 
 /// Window and taskbar icon.
 pub fn window_icon() -> egui::IconData {
@@ -6848,7 +7312,7 @@ impl SpoonApp {
     }
 }
 
-/// Scrollable software list with icons, shared by the Add Server dialog and
+/// Scrollable software list with icons, shared by the create page and
 /// the change-version card. Returns the software that was clicked, if any.
 fn software_picker(
     ui: &mut egui::Ui,
@@ -6892,8 +7356,20 @@ fn software_picker(
     clicked
 }
 
-/// Scrollable version list (newest first) for the selected software, shared
-/// by the Add Server dialog and the change-version card.
+fn show_create_page_scroll_area(
+    ui: &mut egui::Ui,
+    footer_height: f32,
+    contents: impl FnOnce(&mut egui::Ui),
+) {
+    egui::ScrollArea::vertical()
+        .id_salt("create_server_page")
+        .auto_shrink([false, false])
+        .max_height((ui.available_height() - footer_height).max(0.0))
+        .show(ui, contents);
+}
+
+/// Scrollable version list (newest first) for the selected software, used by
+/// the change-version card. The create page renders its own searchable list.
 fn version_picker(
     ui: &mut egui::Ui,
     software: &SoftwareCache,
@@ -6913,8 +7389,9 @@ fn version_picker(
     egui::ScrollArea::vertical()
         .id_salt(id_salt)
         .auto_shrink([false, false])
-        .max_height(170.0)
+        .max_height(240.0)
         .show(ui, |ui| {
+            ui.set_min_height(200.0);
             ui.spacing_mut().item_spacing.y = 2.0;
             for (i, version) in versions.iter().rev().enumerate() {
                 let selected = selected_version.as_ref() == Some(&version.id);
@@ -7233,6 +7710,78 @@ fn memory_stepper(ui: &mut egui::Ui, label: &str, value_mb: &mut u32, min: u32, 
             if ui.add(step_button("−")).clicked() {
                 *value_mb = (*value_mb as i64 - 512).clamp(i64::from(min), i64::from(max)) as u32;
             }
+        });
+    });
+}
+
+/// (Label, server.properties value) pairs for the create-page dropdowns.
+const GAMEMODE_OPTIONS: [(&str, &str); 4] = [
+    ("Survival", "survival"),
+    ("Creative", "creative"),
+    ("Adventure", "adventure"),
+    ("Spectator", "spectator"),
+];
+const DIFFICULTY_OPTIONS: [(&str, &str); 4] = [
+    ("Peaceful", "peaceful"),
+    ("Easy", "easy"),
+    ("Normal", "normal"),
+    ("Hard", "hard"),
+];
+const LEVEL_TYPE_OPTIONS: [(&str, &str); 5] = [
+    ("Default", "minecraft:normal"),
+    ("Superflat", "minecraft:flat"),
+    ("Large Biomes", "minecraft:large_biomes"),
+    ("Amplified", "minecraft:amplified"),
+    ("Single Biome", "minecraft:single_biome_surface"),
+];
+
+/// Small muted caption used above form fields.
+fn form_label(ui: &mut egui::Ui, text: &str) {
+    ui.label(
+        egui::RichText::new(text)
+            .size(12.0)
+            .color(theme::TEXT_MUTED),
+    );
+}
+
+/// A full-width dropdown bound to one of `options`, showing the label of the
+/// selected value.
+fn settings_combo(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash,
+    label: &str,
+    options: &[(&str, &str)],
+    value: &mut String,
+) {
+    form_label(ui, label);
+    let selected_text = options
+        .iter()
+        .find(|(_, candidate)| candidate == value)
+        .map(|(name, _)| *name)
+        .unwrap_or(value.as_str());
+    egui::ComboBox::from_id_salt(id_salt)
+        .width(ui.available_width())
+        .selected_text(selected_text)
+        .show_ui(ui, |ui| {
+            for (name, candidate) in options {
+                ui.selectable_value(value, candidate.to_string(), *name);
+            }
+        });
+}
+
+/// A switch with a title and a one-line explanation beneath it.
+fn settings_toggle(ui: &mut egui::Ui, on: &mut bool, title: &str, description: &str) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 10.0;
+        theme::toggle(ui, on);
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            ui.label(egui::RichText::new(title).size(13.5).color(theme::TEXT));
+            ui.label(
+                egui::RichText::new(description)
+                    .size(11.5)
+                    .color(theme::TEXT_MUTED),
+            );
         });
     });
 }
@@ -8035,23 +8584,29 @@ enum DownloadEvent {
 }
 
 struct PendingCreate {
-    id: String,
-    name: String,
-    server_type: String,
-    server_version: String,
-    dir: PathBuf,
-    max_memory_mb: u32,
-    jvm_args: Vec<String>,
+    config: ServerConfig,
     rx: Receiver<DownloadEvent>,
     downloaded: u64,
     total: u64,
     finished: Option<Result<(), String>>,
 }
 
-pub struct AddDialog {
+/// The full-page "Create Server" form: software/version pickers plus the
+/// world and network settings written to server.properties on creation.
+pub struct CreatePage {
     name: String,
     max_memory_mb: u32,
     jvm_args: String,
+    gamemode: String,
+    difficulty: String,
+    level_type: String,
+    max_players: u32,
+    server_port: u16,
+    level_seed: String,
+    online_mode: bool,
+    use_whitelist: bool,
+    software_filter: String,
+    version_filter: String,
     error: Option<String>,
 
     selected_type: Option<ServerType>,
@@ -8060,20 +8615,26 @@ pub struct AddDialog {
     pending: Option<PendingCreate>,
 }
 
-impl Default for AddDialog {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl AddDialog {
-    fn new() -> Self {
+impl CreatePage {
+    fn new(suggested_port: u16) -> Self {
         Self {
-            name: String::new(),
+            name: "Server".to_string(),
             max_memory_mb: 4096,
             jvm_args: String::new(),
+            gamemode: "survival".to_string(),
+            difficulty: "easy".to_string(),
+            level_type: "minecraft:normal".to_string(),
+            max_players: 20,
+            server_port: suggested_port,
+            level_seed: String::new(),
+            online_mode: true,
+            use_whitelist: true,
+            software_filter: String::new(),
+            version_filter: String::new(),
             error: None,
-            selected_type: None,
+            // Paper is the most common choice; the version defaults to the
+            // newest build once the catalog has loaded.
+            selected_type: Some(ServerType::from_name("PAPER")),
             selected_version: None,
             pending: None,
         }
@@ -8100,14 +8661,14 @@ impl AddDialog {
         }
     }
 
-    fn take_finished(&mut self) -> Option<(PendingCreate, Result<(), String>)> {
+    fn take_finished(&mut self) -> Option<(ServerConfig, Result<(), String>)> {
         self.pending.as_mut()?;
         let finished = self.pending.as_mut()?.finished.take()?;
         let pending = self.pending.take().unwrap();
-        Some((pending, finished))
+        Some((pending.config, finished))
     }
 
-    fn start_create(&mut self, servers_root: &Path) {
+    fn start_create(&mut self, servers_root: &Path, assigned_ports: &[u16]) {
         self.error = None;
 
         let name = self.name.trim().to_string();
@@ -8121,113 +8682,65 @@ impl AddDialog {
             self.error = Some("Select a server software and version.".to_string());
             return;
         };
+        if assigned_ports.contains(&self.server_port)
+            || !spoon_core::port::is_port_available(self.server_port)
+        {
+            let suggestion = next_available_port(DEFAULT_SERVER_PORT, assigned_ports);
+            self.error = Some(format!(
+                "Port {} is already in use; try {}.",
+                self.server_port, suggestion
+            ));
+            return;
+        }
 
-        let id = new_id();
         let dir = unique_server_dir(servers_root, &name);
-        let server_type_name = server_type.api_name();
         if let Err(err) = fs::create_dir_all(&dir) {
             self.error = Some(format!("Could not create server folder: {err}"));
             return;
         }
 
+        let mut config = ServerConfig::new(
+            new_id(),
+            name,
+            dir.join("server.jar"),
+            dir,
+            self.max_memory_mb,
+        );
+        config.jvm_args = self
+            .jvm_args
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        config.server_type = Some(server_type.api_name());
+        config.server_version = Some(version.clone());
+        config.gamemode = self.gamemode.clone();
+        config.difficulty = self.difficulty.clone();
+        config.level_type = self.level_type.clone();
+        config.max_players = self.max_players;
+        config.server_port = self.server_port;
+        config.level_seed = self.level_seed.trim().to_string();
+        config.online_mode = self.online_mode;
+        config.use_whitelist = self.use_whitelist;
+
         let (tx, rx) = mpsc::channel();
-        let thread_dir = dir.clone();
-        let thread_version = version.clone();
+        let thread_config = config.clone();
+        let thread_type = server_type.clone();
         std::thread::spawn(move || {
-            let result = download_and_install(&server_type, &thread_version, &thread_dir, &tx);
+            let result =
+                download_and_install(&thread_type, &version, &thread_config.working_dir, &tx)
+                    .and_then(|_| {
+                        write_server_properties(&thread_config).map_err(|err| err.to_string())
+                    });
             let _ = tx.send(DownloadEvent::Done(result));
         });
 
         self.pending = Some(PendingCreate {
-            id,
-            name,
-            server_type: server_type_name,
-            server_version: version,
-            dir,
-            max_memory_mb: self.max_memory_mb,
-            jvm_args: self
-                .jvm_args
-                .split_whitespace()
-                .map(str::to_string)
-                .collect(),
+            config,
             rx,
             downloaded: 0,
             total: 0,
             finished: None,
         });
-    }
-
-    fn ui(
-        &mut self,
-        ui: &mut egui::Ui,
-        software: &SoftwareCache,
-        icon_textures: &HashMap<String, Option<egui::TextureHandle>>,
-    ) {
-        let field_label = |text: &str| {
-            egui::RichText::new(text)
-                .size(12.0)
-                .color(theme::TEXT_MUTED)
-        };
-
-        ui.label(field_label("Name"));
-        ui.add(egui::TextEdit::singleline(&mut self.name).desired_width(f32::INFINITY));
-        ui.add_space(10.0);
-
-        ui.label(field_label("Server software"));
-        if let Some(server_type) = software_picker(
-            ui,
-            software,
-            icon_textures,
-            "add_software_picker",
-            self.selected_type.as_ref(),
-        ) {
-            self.selected_version = software
-                .versions(&server_type)
-                .last()
-                .map(|newest| newest.id.clone());
-            self.selected_type = Some(server_type);
-        }
-        ui.add_space(10.0);
-
-        ui.label(field_label("Version"));
-        version_picker(
-            ui,
-            software,
-            "add_version_picker",
-            self.selected_type.as_ref(),
-            &mut self.selected_version,
-        );
-        ui.add_space(10.0);
-
-        ui.label(field_label("Memory (max MB)"));
-        ui.add(
-            egui::DragValue::new(&mut self.max_memory_mb)
-                .range(512..=65536)
-                .speed(128),
-        );
-        ui.add_space(10.0);
-
-        ui.label(field_label("JVM arguments (optional)"));
-        ui.add(egui::TextEdit::singleline(&mut self.jvm_args).desired_width(f32::INFINITY));
-
-        if let Some(pending) = &self.pending {
-            ui.add_space(12.0);
-            let fraction = if pending.total > 0 {
-                (pending.downloaded as f32 / pending.total as f32).min(1.0)
-            } else {
-                0.0
-            };
-            ui.add(egui::ProgressBar::new(fraction).text(format!(
-                "Downloading {} / {}",
-                format_mb(pending.downloaded),
-                format_mb(pending.total)
-            )));
-        }
-
-        if let Some(err) = &self.error {
-            ui.add_space(8.0);
-            ui.label(egui::RichText::new(err).color(theme::ERROR));
-        }
     }
 }
 
@@ -8399,9 +8912,10 @@ fn install_server_version(
 #[cfg(test)]
 mod tests {
     use super::{
-        file_path_breadcrumbs, format_duration, parse_online_player_list, sidebar_footer_height,
-        update_online_players,
+        file_path_breadcrumbs, format_duration, parse_online_player_list,
+        show_create_page_scroll_area, sidebar_footer_height, update_online_players,
     };
+    use std::cell::{Cell, RefCell};
     use std::collections::BTreeSet;
     use std::path::Path;
     use std::time::Duration;
@@ -8452,6 +8966,54 @@ mod tests {
             36.0 * 4.0 + 8.0 * 4.0 + 18.0 + 4.0
         );
         assert!(sidebar_footer_height(true) > sidebar_footer_height(false));
+    }
+
+    #[test]
+    fn create_page_actions_stay_inside_visible_area() {
+        let panel_bottom = Cell::new(None);
+        let button_rects = RefCell::new(Vec::new());
+        let fonts_ready = Cell::new(false);
+        let mut harness = egui_kittest::Harness::new(|ctx| {
+            super::theme::apply(ctx);
+            if !fonts_ready.get() {
+                fonts_ready.set(true);
+                ctx.request_repaint();
+                return;
+            }
+            egui::CentralPanel::default().show(ctx, |ui| {
+                panel_bottom.set(Some(ui.max_rect().bottom()));
+                show_create_page_scroll_area(ui, 48.0, |ui| ui.set_min_height(900.0));
+                ui.add_space(6.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let mut rects = button_rects.borrow_mut();
+                    rects.push(
+                        ui.add(super::theme::primary_icon_button(
+                            super::theme::icons::CHECK,
+                            "Create Server",
+                        ))
+                        .rect,
+                    );
+                    rects.push(
+                        ui.add(super::theme::ghost_icon_button(
+                            super::theme::icons::XMARK,
+                            "Cancel",
+                        ))
+                        .rect,
+                    );
+                });
+            });
+        });
+        harness.run_steps(2);
+
+        let bottom = panel_bottom.get().expect("central panel rendered");
+        for rect in button_rects.borrow().iter() {
+            assert!(
+                rect.bottom() <= bottom,
+                "footer button extends below the visible panel: {:.1} > {:.1}",
+                rect.bottom(),
+                bottom
+            );
+        }
     }
 
     #[test]

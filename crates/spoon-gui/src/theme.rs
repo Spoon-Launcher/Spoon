@@ -156,11 +156,23 @@ pub struct AnimatedButton {
     button: egui::Button<'static>,
     fills: [Color32; 4],
     strokes: [Stroke; 4],
+    padding: Option<egui::Vec2>,
+}
+
+impl AnimatedButton {
+    /// Overrides the style's button padding for this button.
+    pub fn padding(mut self, padding: egui::Vec2) -> Self {
+        self.padding = Some(padding);
+        self
+    }
 }
 
 impl egui::Widget for AnimatedButton {
     fn ui(self, ui: &mut egui::Ui) -> egui::Response {
         ui.scope(|ui| {
+            if let Some(padding) = self.padding {
+                ui.spacing_mut().button_padding = padding;
+            }
             let widgets = &mut ui.visuals_mut().widgets;
             widgets.inactive.bg_fill = self.fills[0];
             widgets.inactive.weak_bg_fill = self.fills[0];
@@ -192,6 +204,7 @@ pub fn animated_button(
         button,
         fills: [idle_fill, hover_fill, hover_fill, idle_fill],
         strokes: [idle_stroke, hover_stroke, hover_stroke, idle_stroke],
+        padding: None,
     }
 }
 
@@ -294,6 +307,7 @@ pub mod icons {
     pub const GLOBE: &str = "\u{f0ac}";
     pub const FINGERPRINT: &str = "\u{f577}";
     pub const COMMENTS: &str = "\u{f086}";
+    pub const COFFEE: &str = "\u{f0f4}";
     pub const SERVER: &str = "\u{f233}";
     pub const TERMINAL: &str = "\u{f120}";
     pub const PAPER_PLANE: &str = "\u{f1d8}";
@@ -304,10 +318,13 @@ pub mod icons {
     pub const XMARK: &str = "\u{f00d}";
     pub const FILE: &str = "\u{f15b}";
     pub const SLIDERS: &str = "\u{f1de}";
+    pub const GAUGE_HIGH: &str = "\u{f625}";
+    pub const TAG: &str = "\u{f02b}";
     pub const FOLDER: &str = "\u{f07b}";
     pub const FILE_LINES: &str = "\u{f15c}";
     pub const PEN: &str = "\u{f304}";
     pub const ARROW_UP: &str = "\u{f062}";
+    pub const ARROW_LEFT: &str = "\u{f060}";
     pub const ARROW_RIGHT: &str = "\u{f061}";
     pub const ROTATE: &str = "\u{f2f1}";
     pub const FOLDER_PLUS: &str = "\u{f65e}";
@@ -409,6 +426,47 @@ pub fn warn_icon_button(glyph: &str, text: &str) -> AnimatedButton {
     )
 }
 
+/// An animated on/off switch, `WIDTH`x`HEIGHT` points tall. Flips `on` when
+/// clicked; pair with a label next to it.
+pub fn toggle(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
+    let desired_size = egui::vec2(40.0, 22.0);
+    let (rect, mut response) = ui.allocate_exact_size(desired_size, egui::Sense::click());
+    if response.clicked() {
+        *on = !*on;
+        response.mark_changed();
+    }
+    let amount = ui
+        .ctx()
+        .animate_bool_with_time(response.id, *on, ui.style().animation_time);
+
+    let painter = ui.painter();
+    let track = rect.shrink(1.0);
+    let off_fill = CONSOLE_BG;
+    let on_fill = PRIMARY;
+    painter.rect_filled(
+        track,
+        egui::CornerRadius::same(255),
+        off_fill.lerp_to_gamma(on_fill, amount),
+    );
+    painter.rect_stroke(
+        track,
+        egui::CornerRadius::same(255),
+        Stroke::new(1.0_f32, BORDER),
+        egui::StrokeKind::Inside,
+    );
+    let knob_radius = 7.0;
+    let knob_x = egui::lerp(
+        (track.left() + knob_radius + 2.0)..=(track.right() - knob_radius - 2.0),
+        amount,
+    );
+    painter.circle_filled(
+        egui::pos2(knob_x, track.center().y),
+        knob_radius,
+        TEXT.lerp_to_gamma(BACKGROUND, amount * 0.5),
+    );
+    response
+}
+
 /// A rounded card container.
 pub fn card() -> egui::Frame {
     egui::Frame::new()
@@ -416,6 +474,36 @@ pub fn card() -> egui::Frame {
         .stroke(Stroke::new(1.0_f32, BORDER))
         .corner_radius(egui::CornerRadius::same(10))
         .inner_margin(egui::Margin::symmetric(14, 10))
+}
+
+/// A rail-style navigation button: filled accent square when active, quiet
+/// transparent icon button otherwise. Icon-only; pair with a hover tooltip.
+pub fn nav_icon_tab(active: bool, glyph: &str) -> AnimatedButton {
+    let rounding = egui::CornerRadius::same(8);
+    let square = egui::vec2(36.0, 36.0);
+    if active {
+        animated_button(
+            egui::Button::new(icon(glyph, 16.0).color(BACKGROUND))
+                .min_size(square)
+                .corner_radius(rounding),
+            PRIMARY,
+            PRIMARY_HOVER,
+            Stroke::NONE,
+            Stroke::NONE,
+        )
+        .padding(egui::vec2(0.0, 0.0))
+    } else {
+        animated_button(
+            egui::Button::new(icon(glyph, 16.0).color(TEXT_MUTED))
+                .min_size(square)
+                .corner_radius(rounding),
+            Color32::TRANSPARENT,
+            SURFACE_HOVER,
+            Stroke::NONE,
+            Stroke::NONE,
+        )
+        .padding(egui::vec2(0.0, 0.0))
+    }
 }
 
 /// A dashboard-style navigation tab: filled accent pill when active,

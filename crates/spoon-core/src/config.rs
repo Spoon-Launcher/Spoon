@@ -24,6 +24,54 @@ pub struct ServerConfig {
     pub max_memory_mb: u32,
     pub jvm_args: Vec<String>,
     pub server_args: Vec<String>,
+    /// `gamemode` written to server.properties when the server is created.
+    #[serde(default = "default_gamemode")]
+    pub gamemode: String,
+    /// `difficulty` written to server.properties when the server is created.
+    #[serde(default = "default_difficulty")]
+    pub difficulty: String,
+    /// `level-type` written to server.properties when the server is created.
+    #[serde(default = "default_level_type")]
+    pub level_type: String,
+    /// `max-players` written to server.properties when the server is created.
+    #[serde(default = "default_max_players")]
+    pub max_players: u32,
+    /// `server-port`; defaults to 25565 like a stock Minecraft server.
+    #[serde(default = "default_server_port")]
+    pub server_port: u16,
+    /// `level-seed`; empty means the server picks a random seed.
+    #[serde(default)]
+    pub level_seed: String,
+    /// `online-mode` written to server.properties when the server is created.
+    #[serde(default = "default_true")]
+    pub online_mode: bool,
+    /// `white-list` written to server.properties when the server is created.
+    #[serde(default = "default_true")]
+    pub use_whitelist: bool,
+}
+
+fn default_gamemode() -> String {
+    "survival".to_string()
+}
+
+fn default_difficulty() -> String {
+    "easy".to_string()
+}
+
+fn default_level_type() -> String {
+    "minecraft:normal".to_string()
+}
+
+fn default_max_players() -> u32 {
+    20
+}
+
+fn default_server_port() -> u16 {
+    crate::port::DEFAULT_SERVER_PORT
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl ServerConfig {
@@ -46,6 +94,14 @@ impl ServerConfig {
             max_memory_mb,
             jvm_args: Vec::new(),
             server_args: Vec::new(),
+            gamemode: default_gamemode(),
+            difficulty: default_difficulty(),
+            level_type: default_level_type(),
+            max_players: default_max_players(),
+            server_port: default_server_port(),
+            level_seed: String::new(),
+            online_mode: default_true(),
+            use_whitelist: default_true(),
         }
     }
 
@@ -204,6 +260,43 @@ mod tests {
         assert_eq!(config.server_type, None);
         assert_eq!(config.server_version, None);
         assert_eq!(config.java_runtime, None);
+        assert_eq!(config.gamemode, "survival");
+        assert_eq!(config.difficulty, "easy");
+        assert_eq!(config.level_type, "minecraft:normal");
+        assert_eq!(config.max_players, 20);
+        assert_eq!(config.server_port, 25565);
+        assert_eq!(config.level_seed, "");
+        assert!(config.online_mode);
+        assert!(config.use_whitelist);
+    }
+
+    #[test]
+    fn roundtrips_world_and_network_settings() {
+        let mut config = ServerConfig::new(
+            "id".into(),
+            "Name".into(),
+            "server.jar".into(),
+            "server".into(),
+            4096,
+        );
+        config.gamemode = "creative".into();
+        config.difficulty = "hard".into();
+        config.level_type = "minecraft:flat".into();
+        config.max_players = 100;
+        config.server_port = 25599;
+        config.level_seed = "42".into();
+        config.online_mode = false;
+        config.use_whitelist = false;
+        let text = serde_json::to_string(&config).unwrap();
+        let parsed: ServerConfig = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed.gamemode, "creative");
+        assert_eq!(parsed.difficulty, "hard");
+        assert_eq!(parsed.level_type, "minecraft:flat");
+        assert_eq!(parsed.max_players, 100);
+        assert_eq!(parsed.server_port, 25599);
+        assert_eq!(parsed.level_seed, "42");
+        assert!(!parsed.online_mode);
+        assert!(!parsed.use_whitelist);
     }
 
     #[test]

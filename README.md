@@ -15,7 +15,7 @@ Join the [Discord](https://discord.gg/7UEZnsMMkf) for updates and to talk with t
 ## What you can do
 
 - **Manage server instances** — create servers with your chosen software, version, memory, and JVM
-  argument.
+  arguments.
 - **Set up server software** — choose from vanilla, Paper, Fabric, Forge, and 20+ other server
   types.
 - **Use a live console** — view colorized output, send commands, search and filter the console, and

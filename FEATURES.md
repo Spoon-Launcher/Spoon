@@ -10,11 +10,10 @@ Status: ✅ Done · 🟡 In Progress · ⬜ Planned
 - ✅ Restart server
 - ✅ Persist instance list between launches
 - ⬜ Native UPNP
-- ⬜ Port Assigner (Start at 25565 and work up. Check for ports that are already assigned/in use to make sure there are no conflicts)
+- ✅ Port Assigner (Start at 25565 and work up. Check for ports that are already assigned/in use to make sure there are no conflicts)
 - ⬜ Headless Mode / Multi-Node local link
 - ⬜ Support for Rust based server softwares
-- ⬜ Basic & Advanced Mode
-- ⬜ Java & Rust version management
+- ✅ Java version management
 
 ## Console
 
@@ -40,7 +39,7 @@ Status: ✅ Done · 🟡 In Progress · ⬜ Planned
 
 ## Quality of Life
 
-- 🟡 In-app update checker & downloader (Pulls from GitHub Releases)
+- ✅ In-app update checker & downloader (Pulls from GitHub Releases)
 - ⬜ Auto-restart on crash
 - ⬜ Scheduled restarts / tasks
 - ✅ Backups (backup the server root folder under Spoon/backups)

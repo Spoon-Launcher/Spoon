@@ -9,6 +9,8 @@ pub mod highlight;
 pub mod java;
 pub mod mcjars;
 pub mod players;
+pub mod port;
+pub mod properties;
 pub mod updater;
 
 pub use backup::{BackupInfo, BackupStore};
@@ -20,4 +22,6 @@ pub use players::{
     parse_position_command_output, read_player_catalog, read_player_details, remove_ip_ban,
     remove_player_ban, remove_whitelist_player, PlayerCatalog, PlayerDetails, PlayerProfile,
 };
+pub use port::{next_available_port, next_unassigned_port, DEFAULT_SERVER_PORT};
 pub use process::{LogLine, LogStream, ServerHandle, ServerState};
+pub use properties::{set_properties, write_server_properties};
