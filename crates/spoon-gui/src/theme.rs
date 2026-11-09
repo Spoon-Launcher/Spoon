@@ -27,6 +27,11 @@ pub fn icon_family() -> egui::FontFamily {
     egui::FontFamily::Name("awesome".into())
 }
 
+/// Font family hosting Font Awesome brand glyphs.
+pub fn brand_icon_family() -> egui::FontFamily {
+    egui::FontFamily::Name("awesome_brands".into())
+}
+
 fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     fonts.font_data.insert(
@@ -49,6 +54,14 @@ fn install_fonts(ctx: &egui::Context) {
             "../../../assets/fonts/fa-solid-900.ttf"
         ))),
     );
+    // Font Awesome Free 7.3.1 (brands) — icons CC BY 4.0, font SIL OFL 1.1,
+    // see https://fontawesome.com/license.
+    fonts.font_data.insert(
+        "fa_brands".into(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../../../assets/fonts/fa-brands-400.otf"
+        ))),
+    );
     // Lilita first, with the default fonts kept as fallback for missing glyphs.
     fonts
         .families
@@ -67,6 +80,9 @@ fn install_fonts(ctx: &egui::Context) {
     fonts
         .families
         .insert(icon_family(), vec!["fa_solid".to_string()]);
+    fonts
+        .families
+        .insert(brand_icon_family(), vec!["fa_brands".to_string()]);
     ctx.set_fonts(fonts);
 }
 
@@ -332,6 +348,15 @@ pub mod icons {
     pub const FILE_ZIPPER: &str = "\u{f1c6}";
     pub const ELLIPSIS: &str = "\u{f141}";
     pub const JAVA: &str = "\u{f7b6}";
+    pub const PALETTE: &str = "\u{f53f}";
+    pub const IMAGE: &str = "\u{f03e}";
+    pub const LINK: &str = "\u{f0c1}";
+}
+
+/// Font Awesome Free brand glyphs.
+pub mod brand_icons {
+    pub const DISCORD: &str = "\u{f392}";
+    pub const KO_FI: &str = "\u{e856}";
 }
 
 /// A single Font Awesome glyph (color it with `.color(..)` as needed).

@@ -28,6 +28,7 @@ Status: ✅ Done · 🟡 In Progress · ⬜ Planned
 - ✅ Server jar download / version picker (MCJars API — vanilla, Paper, Fabric, Forge, 20+ others)
 - ✅ EULA acceptance helper
 - ✅ Edit server.properties from the GUI
+- ✅ Appearance settings (MOTD with § color palette, resource pack URL, server icon presets & custom import)
 - ✅ Version changer in server settings
 - ✅ Import existing server folder into Spoon's server directory
 
@@ -56,4 +57,4 @@ Status: ✅ Done · 🟡 In Progress · ⬜ Planned
 
 - ✅ Windows 10+ (via `.\scripts\build-windows.ps1` or `./scripts/build-{macos,linux}.sh`)
 - 🟡 Linux (.deb via `./scripts/build-linux.sh` or `./scripts/build-macos.sh`; AppImage needs Linux tooling/CI)
-- ✅ macOS (Intel & Apple Silicon, via `./scripts/build-macos.sh`)
+- ⬜ macOS (Intel & Apple Silicon, via `./scripts/build-macos.sh`)

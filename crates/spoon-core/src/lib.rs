@@ -1,6 +1,7 @@
 mod config;
 mod process;
 
+pub mod appearance;
 pub mod backup;
 pub mod bootstrap;
 pub mod eula;
@@ -13,6 +14,7 @@ pub mod port;
 pub mod properties;
 pub mod updater;
 
+pub use appearance::fit_square;
 pub use backup::{BackupInfo, BackupStore};
 pub use config::{
     new_id, sanitize_folder_name, unique_server_dir, AppSettings, ServerConfig, ServerStore,
@@ -24,4 +26,4 @@ pub use players::{
 };
 pub use port::{next_available_port, next_unassigned_port, DEFAULT_SERVER_PORT};
 pub use process::{LogLine, LogStream, ServerHandle, ServerState};
-pub use properties::{set_properties, write_server_properties};
+pub use properties::{read_property, set_properties, write_server_properties};

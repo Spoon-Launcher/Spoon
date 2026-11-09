@@ -1834,6 +1834,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -3474,6 +3476,7 @@ dependencies = [
  "chrono",
  "dirs",
  "flate2",
+ "image",
  "indexmap",
  "md-5",
  "reqwest",

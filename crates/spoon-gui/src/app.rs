@@ -7,6 +7,9 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use spoon_core::appearance::{
+    clear_server_icon, read_server_icon, server_icon_path, write_server_icon,
+};
 use spoon_core::backup::{BackupInfo, BackupStore};
 use spoon_core::bootstrap;
 use spoon_core::eula::{accept_eula, eula_state, EulaState};
@@ -21,8 +24,9 @@ use spoon_core::players::{
 };
 use spoon_core::updater::{updates_dir, UpdateClient, UpdateInfo};
 use spoon_core::{
-    new_id, next_available_port, unique_server_dir, write_server_properties, AppSettings, LogLine,
-    ServerConfig, ServerHandle, ServerState, ServerStore, DEFAULT_SERVER_PORT,
+    new_id, next_available_port, read_property, set_properties, unique_server_dir,
+    write_server_properties, AppSettings, LogLine, ServerConfig, ServerHandle, ServerState,
+    ServerStore, DEFAULT_SERVER_PORT,
 };
 
 use crate::theme;
@@ -60,7 +64,7 @@ type PlayerSkinFetch = (String, Result<Vec<u8>, String>);
 #[derive(Clone, Copy)]
 enum SocialButtonIcon {
     Discord,
-    Coffee,
+    KoFi,
 }
 
 fn social_link_button(
@@ -100,39 +104,17 @@ fn social_link_button(
         icon_size,
     );
 
-    match icon {
-        SocialButtonIcon::Discord => {
-            painter.rect_filled(icon_rect, egui::CornerRadius::same(6), egui::Color32::WHITE);
-            let cutout = fill;
-            painter.circle_filled(
-                egui::pos2(icon_rect.left() + 6.0, icon_rect.center().y - 1.0),
-                1.2,
-                cutout,
-            );
-            painter.circle_filled(
-                egui::pos2(icon_rect.right() - 6.0, icon_rect.center().y - 1.0),
-                1.2,
-                cutout,
-            );
-            painter.add(egui::Shape::line(
-                vec![
-                    egui::pos2(icon_rect.left() + 5.0, icon_rect.center().y + 3.0),
-                    egui::pos2(icon_rect.center().x, icon_rect.center().y + 4.0),
-                    egui::pos2(icon_rect.right() - 5.0, icon_rect.center().y + 3.0),
-                ],
-                egui::Stroke::new(1.2_f32, cutout),
-            ));
-        }
-        SocialButtonIcon::Coffee => {
-            painter.text(
-                icon_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                theme::icons::COFFEE,
-                egui::FontId::new(15.0, theme::icon_family()),
-                egui::Color32::WHITE,
-            );
-        }
-    }
+    let glyph = match icon {
+        SocialButtonIcon::Discord => theme::brand_icons::DISCORD,
+        SocialButtonIcon::KoFi => theme::brand_icons::KO_FI,
+    };
+    painter.text(
+        icon_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        glyph,
+        egui::FontId::new(16.0, theme::brand_icon_family()),
+        egui::Color32::WHITE,
+    );
 
     painter.galley(
         egui::pos2(
@@ -255,7 +237,6 @@ enum PlayerView {
 }
 
 enum PlayerManagementResult {
-    Loaded(PlayerCatalog),
     Added(PlayerProfile),
     Removed(String),
     Banned(PlayerProfile),
@@ -270,6 +251,7 @@ struct PlayerManagementState {
     username: String,
     ip_address: String,
     pending: Option<Receiver<Result<PlayerManagementResult, String>>>,
+    refresh_pending: Option<Receiver<Result<PlayerCatalog, String>>>,
     last_refresh: Option<Instant>,
     error: Option<String>,
     notice: Option<String>,
@@ -283,6 +265,7 @@ impl PlayerManagementState {
             username: String::new(),
             ip_address: String::new(),
             pending: None,
+            refresh_pending: None,
             last_refresh: None,
             error: None,
             notice: None,
@@ -290,7 +273,7 @@ impl PlayerManagementState {
     }
 
     fn refresh(&mut self, working_dir: PathBuf, clear_feedback: bool) {
-        if self.pending.is_some() {
+        if self.pending.is_some() || self.refresh_pending.is_some() {
             return;
         }
         if clear_feedback {
@@ -299,10 +282,35 @@ impl PlayerManagementState {
         }
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let result = read_player_catalog(&working_dir).map(PlayerManagementResult::Loaded);
+            let result = read_player_catalog(&working_dir);
             let _ = tx.send(result);
         });
-        self.pending = Some(rx);
+        self.refresh_pending = Some(rx);
+    }
+
+    fn poll_refresh(&mut self) -> bool {
+        let result = self.refresh_pending.as_ref().map(Receiver::try_recv);
+        match result {
+            Some(Ok(Ok(catalog))) => {
+                self.refresh_pending = None;
+                self.catalog = Some(catalog);
+                self.error = None;
+                self.notice = None;
+            }
+            Some(Ok(Err(err))) => {
+                self.refresh_pending = None;
+                self.error = Some(err);
+                self.notice = None;
+            }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.refresh_pending = None;
+                self.error = Some("Player catalog refresh stopped unexpectedly.".to_string());
+                self.notice = None;
+            }
+            Some(Err(mpsc::TryRecvError::Empty)) => return true,
+            None => return false,
+        }
+        false
     }
 
     fn add(&mut self, working_dir: PathBuf) {
@@ -318,6 +326,7 @@ impl PlayerManagementState {
             self.notice = None;
             return;
         }
+        self.refresh_pending = None;
         self.error = None;
         self.notice = None;
         let (tx, rx) = mpsc::channel();
@@ -333,6 +342,7 @@ impl PlayerManagementState {
         if self.pending.is_some() {
             return;
         }
+        self.refresh_pending = None;
         self.error = None;
         self.notice = None;
         let (tx, rx) = mpsc::channel();
@@ -348,6 +358,7 @@ impl PlayerManagementState {
         if self.pending.is_some() {
             return;
         }
+        self.refresh_pending = None;
         self.error = None;
         self.notice = None;
         let (tx, rx) = mpsc::channel();
@@ -363,6 +374,7 @@ impl PlayerManagementState {
         if self.pending.is_some() {
             return;
         }
+        self.refresh_pending = None;
         self.error = None;
         self.notice = None;
         let (tx, rx) = mpsc::channel();
@@ -378,6 +390,7 @@ impl PlayerManagementState {
         if self.pending.is_some() {
             return;
         }
+        self.refresh_pending = None;
         self.error = None;
         self.notice = None;
         let (tx, rx) = mpsc::channel();
@@ -392,6 +405,7 @@ impl PlayerManagementState {
         if self.pending.is_some() {
             return;
         }
+        self.refresh_pending = None;
         self.error = None;
         self.notice = None;
         let (tx, rx) = mpsc::channel();
@@ -406,12 +420,6 @@ impl PlayerManagementState {
     fn poll(&mut self, handle: Option<&mut ServerHandle>) -> bool {
         let result = self.pending.as_ref().map(Receiver::try_recv);
         match result {
-            Some(Ok(Ok(PlayerManagementResult::Loaded(catalog)))) => {
-                self.pending = None;
-                self.catalog = Some(catalog);
-                self.error = None;
-                self.notice = None;
-            }
             Some(Ok(Ok(PlayerManagementResult::Added(profile)))) => {
                 self.pending = None;
                 let whitelist = &mut self
@@ -538,8 +546,6 @@ enum PlayerDetailsAction {
     RemovePlayerBan(String),
     AddIpBan(String),
     RemoveIpBan(String),
-    AddToWhitelist,
-    RemoveFromWhitelist(String),
 }
 
 struct ImportDialog {
@@ -1144,6 +1150,7 @@ impl SpoonApp {
     fn poll_player_management(&mut self, ctx: &egui::Context) {
         let mut pending = false;
         for entry in &mut self.servers {
+            pending |= entry.player_management.poll_refresh();
             pending |= entry.player_management.poll(entry.handle.as_mut());
         }
         if pending {
@@ -1720,7 +1727,7 @@ impl SpoonApp {
                         "Ko-fi",
                         "Support Spoon on Ko-fi",
                         KOFI_BUTTON_COLOR,
-                        SocialButtonIcon::Coffee,
+                        SocialButtonIcon::KoFi,
                     ) {
                         ui.ctx().open_url(egui::OpenUrl::new_tab(KOFI_URL));
                     }
@@ -2760,19 +2767,27 @@ impl SpoonApp {
         let mut remove_ip_entry = None;
         let mut selected_player = None;
         let mut visible_skin_requests = Vec::new();
-        ui.horizontal(|ui| {
-            theme::section_title_with_icon(ui, theme::icons::USERS, "PLAYER MANAGEMENT");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if selected_view == PlayerView::Online
-                    && !online_players.is_empty()
-                    && ui
-                        .add(theme::ghost_icon_button(theme::icons::COPY, "Copy list"))
-                        .clicked()
-                {
-                    copy = true;
-                }
-            });
-        });
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
+            egui::Layout::left_to_right(egui::Align::Min),
+            |ui| {
+                ui.label(theme::title_with_icon(
+                    theme::icons::USERS,
+                    "Player Management",
+                    theme::PRIMARY,
+                ));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if selected_view == PlayerView::Online
+                        && !online_players.is_empty()
+                        && ui
+                            .add(theme::ghost_icon_button(theme::icons::COPY, "Copy list"))
+                            .clicked()
+                    {
+                        copy = true;
+                    }
+                });
+            },
+        );
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             for (view, glyph, label) in [
@@ -2834,7 +2849,10 @@ impl SpoonApp {
             ),
             PlayerView::Offline => {
                 if entry.player_management.catalog.is_none() {
-                    render_player_list_loading(ui, entry.player_management.pending.is_some());
+                    render_player_list_loading(
+                        ui,
+                        entry.player_management.refresh_pending.is_some(),
+                    );
                 } else {
                     render_player_list(
                         ui,
@@ -2907,7 +2925,10 @@ impl SpoonApp {
                         );
                     });
                 } else if entry.player_management.catalog.is_none() {
-                    render_player_list_loading(ui, false);
+                    render_player_list_loading(
+                        ui,
+                        entry.player_management.refresh_pending.is_some(),
+                    );
                 } else if whitelist.is_empty() {
                     render_player_list_empty(
                         ui,
@@ -2992,7 +3013,10 @@ impl SpoonApp {
                         );
                     });
                 } else if entry.player_management.catalog.is_none() {
-                    render_player_list_loading(ui, false);
+                    render_player_list_loading(
+                        ui,
+                        entry.player_management.refresh_pending.is_some(),
+                    );
                 } else if ip_bans.is_empty() {
                     render_player_list_empty(
                         ui,
@@ -3159,7 +3183,6 @@ impl SpoonApp {
         let (
             is_online,
             server_running,
-            whitelist_uuid,
             banned_uuid,
             is_ip_banned,
             catalog_loaded,
@@ -3170,17 +3193,6 @@ impl SpoonApp {
             .servers
             .get(dialog.server_index)
             .map(|entry| {
-                let whitelist_uuid = entry
-                    .player_management
-                    .catalog
-                    .as_ref()
-                    .and_then(|catalog| {
-                        catalog
-                            .whitelist
-                            .iter()
-                            .find(|profile| profile.name.eq_ignore_ascii_case(&dialog.name))
-                    })
-                    .map(|profile| profile.uuid.clone());
                 let player_uuid = dialog
                     .details
                     .as_ref()
@@ -3232,7 +3244,6 @@ impl SpoonApp {
                         .handle
                         .as_ref()
                         .is_some_and(|handle| handle.state() != ServerState::Stopped),
-                    whitelist_uuid,
                     banned_profile.map(|profile| profile.uuid.clone()),
                     is_ip_banned,
                     entry.player_management.catalog.is_some(),
@@ -3241,7 +3252,7 @@ impl SpoonApp {
                     entry.player_management.notice.clone(),
                 )
             })
-            .unwrap_or((false, false, None, None, false, false, false, None, None));
+            .unwrap_or((false, false, None, false, false, false, None, None));
         dialog.is_online = is_online;
         let player_name_valid = is_minecraft_username(&dialog.name);
         let mut close = false;
@@ -3476,30 +3487,6 @@ impl SpoonApp {
                         ip.map(PlayerDetailsAction::AddIpBan)
                     };
                 }
-                if let Some(uuid) = &whitelist_uuid {
-                    if ui
-                        .add_enabled(
-                            !management_pending,
-                            theme::danger_button("Remove from whitelist"),
-                        )
-                        .clicked()
-                    {
-                        requested_action =
-                            Some(PlayerDetailsAction::RemoveFromWhitelist(uuid.clone()));
-                    }
-                } else if catalog_loaded {
-                    if ui
-                        .add_enabled(
-                            !management_pending && player_name_valid,
-                            theme::primary_button("Whitelist"),
-                        )
-                        .clicked()
-                    {
-                        requested_action = Some(PlayerDetailsAction::AddToWhitelist);
-                    }
-                } else {
-                    ui.add_enabled(false, theme::secondary_button("Whitelist"));
-                }
             });
             ui.label(
                 egui::RichText::new(
@@ -3603,21 +3590,6 @@ impl SpoonApp {
                 dialog.action_notice =
                     Some(format!("{notice} Check the server console for result."));
             }
-            PlayerDetailsAction::AddToWhitelist => {
-                let Some(entry) = self.servers.get_mut(dialog.server_index) else {
-                    dialog.action_error = Some("The server is no longer available.".to_string());
-                    return;
-                };
-                if entry.player_management.pending.is_some() {
-                    dialog.action_error =
-                        Some("Player data is updating. Try the action again shortly.".to_string());
-                    return;
-                }
-                entry.player_management.username = dialog.name.clone();
-                entry
-                    .player_management
-                    .add(entry.config.working_dir.clone());
-            }
             PlayerDetailsAction::AddPlayerBan => {
                 let Some(entry) = self.servers.get_mut(dialog.server_index) else {
                     dialog.action_error = Some("The server is no longer available.".to_string());
@@ -3709,20 +3681,6 @@ impl SpoonApp {
                 entry
                     .player_management
                     .unban_ip(entry.config.working_dir.clone(), ip);
-            }
-            PlayerDetailsAction::RemoveFromWhitelist(uuid) => {
-                let Some(entry) = self.servers.get_mut(dialog.server_index) else {
-                    dialog.action_error = Some("The server is no longer available.".to_string());
-                    return;
-                };
-                if entry.player_management.pending.is_some() {
-                    dialog.action_error =
-                        Some("Player data is updating. Try the action again shortly.".to_string());
-                    return;
-                }
-                entry
-                    .player_management
-                    .remove(entry.config.working_dir.clone(), uuid);
             }
         }
     }
@@ -5287,139 +5245,90 @@ impl SpoonApp {
             "Server Settings",
             theme::PRIMARY,
         ));
-        ui.add_space(2.0);
-        ui.label(
-            egui::RichText::new(&self.servers[server_index].config.name)
-                .size(13.0)
-                .color(theme::TEXT_MUTED),
-        );
         ui.add_space(14.0);
+        let working_dir = self.servers[server_index].config.working_dir.clone();
+        let ctx = ui.ctx().clone();
         egui::ScrollArea::vertical()
             .id_salt("settings_scroll")
             .auto_shrink([false, false])
             .max_height((ui.available_height() - 70.0).max(240.0))
             .show(ui, |ui| {
-                theme::section_title_with_icon(ui, theme::icons::SLIDERS, "General");
-                ui.add_space(4.0);
-                {
-                    let dialog = self.settings_dialog.as_mut().unwrap();
-                    theme::card().show(ui, |ui| {
-                        ui.label(
-                            egui::RichText::new("Name")
-                                .size(12.0)
-                                .color(theme::TEXT_MUTED),
-                        );
-                        let name_response = ui.add(
-                            egui::TextEdit::singleline(&mut dialog.name)
-                                .desired_width(f32::INFINITY),
-                        );
-                        if name_response.changed() {
-                            dialog.name_error = None;
-                        }
-                        if let Some(err) = &dialog.name_error {
-                            ui.label(egui::RichText::new(err).color(theme::ERROR));
-                        }
-                    });
-                }
-                ui.add_space(14.0);
+                // Two columns on wide windows: launch settings on the left,
+                // public-facing appearance settings on the right.
+                let column_count = if ui.available_width() >= 760.0 { 2 } else { 1 };
+                ui.columns(column_count, |columns| {
+                    {
+                        let ui = &mut columns[0];
+                        theme::section_title_with_icon(ui, theme::icons::SLIDERS, "General");
+                        ui.add_space(4.0);
+                        render_settings_name_card(ui, self.settings_dialog.as_mut().unwrap());
+                        ui.add_space(14.0);
 
-                theme::section_title_with_icon(ui, theme::icons::JAVA, "Java");
-                ui.add_space(4.0);
-                {
-                    let dialog = self.settings_dialog.as_mut().unwrap();
-                    theme::card().show(ui, |ui| {
-                        ui.add_enabled_ui(!running, |ui| {
-                            let mut draft = dialog.java_runtime.clone();
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 8.0;
-                                if ui
-                                    .add(egui::RadioButton::new(draft.is_none(), ""))
-                                    .clicked()
-                                {
-                                    draft = None;
-                                }
-                                ui.label(
-                                    theme::icon(theme::icons::JAVA, 14.0).color(theme::TEXT_MUTED),
-                                );
-                                ui.label(
-                                    egui::RichText::new(format!("App default ({app_java_label})"))
-                                        .color(theme::TEXT),
+                        theme::section_title_with_icon(ui, theme::icons::JAVA, "Java");
+                        ui.add_space(4.0);
+                        render_settings_java_card(
+                            ui,
+                            self.settings_dialog.as_mut().unwrap(),
+                            running,
+                            &app_java_label,
+                            &installed,
+                        );
+                        ui.add_space(14.0);
+
+                        theme::section_title_with_icon(ui, theme::icons::MEMORY, "Memory");
+                        ui.add_space(4.0);
+                        let usage = format_mb(self.servers[server_index].memory_bytes);
+                        render_settings_memory_card(
+                            ui,
+                            self.settings_dialog.as_mut().unwrap(),
+                            running,
+                            &usage,
+                            &effective_java_label,
+                        );
+                    }
+                    {
+                        let ui = &mut columns[column_count - 1];
+                        theme::section_title_with_icon(ui, theme::icons::COMMENTS, "MOTD");
+                        ui.add_space(4.0);
+                        theme::card().show(ui, |ui| {
+                            ui.add_enabled_ui(!running, |ui| {
+                                render_motd_editor(ui, self.settings_dialog.as_mut().unwrap());
+                            });
+                        });
+                        ui.add_space(14.0);
+
+                        theme::section_title_with_icon(ui, theme::icons::GLOBE, "Resource Pack");
+                        ui.add_space(4.0);
+                        theme::card().show(ui, |ui| {
+                            ui.add_enabled_ui(!running, |ui| {
+                                render_resource_pack_field(
+                                    ui,
+                                    self.settings_dialog.as_mut().unwrap(),
                                 );
                             });
-                            for runtime in &installed {
-                                let id = Some(runtime.id.clone());
-                                let is_selected = draft == id;
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 8.0;
-                                    if ui.add(egui::RadioButton::new(is_selected, "")).clicked() {
-                                        draft = id.clone();
-                                    }
-                                    ui.label(
-                                        theme::icon(theme::icons::JAVA, 14.0).color(theme::PRIMARY),
-                                    );
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "Java {} · {}",
-                                            runtime.feature, runtime.release
-                                        ))
-                                        .color(theme::TEXT),
-                                    );
-                                });
-                            }
-                            if draft != dialog.java_runtime {
-                                dialog.java_runtime = draft;
-                            }
-                            ui.add_space(2.0);
-                            ui.label(
-                                egui::RichText::new("Applied on next start")
-                                    .size(12.0)
-                                    .color(theme::TEXT_MUTED),
-                            );
                         });
-                    });
-                }
-                ui.add_space(14.0);
+                        ui.add_space(14.0);
 
-                theme::section_title_with_icon(ui, theme::icons::MEMORY, "Memory");
-                ui.add_space(4.0);
-                {
-                    let dialog = self.settings_dialog.as_mut().unwrap();
-                    let usage = format_mb(self.servers[server_index].memory_bytes);
-                    theme::card().show(ui, |ui| {
-                        ui.add_enabled_ui(!running, |ui| {
-                            memory_stepper(
-                                ui,
-                                "Minimum RAM",
-                                &mut dialog.min_memory_mb,
-                                128,
-                                dialog.max_memory_mb.max(128),
-                            );
-                            ui.add_space(6.0);
-                            memory_stepper(
-                                ui,
-                                "Maximum RAM",
-                                &mut dialog.max_memory_mb,
-                                512,
-                                65_536,
-                            );
-                            ui.add_space(6.0);
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "Applied on next start · launched with {effective_java_label}"
-                                ))
+                        theme::section_title_with_icon(ui, theme::icons::IMAGE, "Server Icon");
+                        ui.add_space(4.0);
+                        theme::card().show(ui, |ui| {
+                            ui.add_enabled_ui(!running, |ui| {
+                                render_icon_selector(
+                                    ui,
+                                    &ctx,
+                                    self.settings_dialog.as_mut().unwrap(),
+                                    &working_dir,
+                                );
+                            });
+                        });
+                        ui.add_space(2.0);
+                        ui.label(
+                            egui::RichText::new("Applied on next start")
                                 .size(12.0)
                                 .color(theme::TEXT_MUTED),
-                            );
-                        });
-                        if running {
-                            ui.label(
-                                egui::RichText::new(format!("Using {usage} right now"))
-                                    .size(12.5)
-                                    .color(theme::PRIMARY),
-                            );
-                        }
-                    });
-                }
+                        );
+                    }
+                });
                 ui.add_space(14.0);
 
                 if running {
@@ -5430,12 +5339,32 @@ impl SpoonApp {
                 }
             });
         ui.add_space(14.0);
+        let saved_until = self
+            .settings_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.saved_until)
+            .filter(|until| *until > Instant::now());
+        if let Some(until) = saved_until {
+            ui.ctx()
+                .request_repaint_after(until.saturating_duration_since(Instant::now()));
+        }
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .add_enabled(
                         !running,
-                        theme::primary_icon_button(theme::icons::SAVE, "Save settings"),
+                        theme::primary_icon_button(
+                            if saved_until.is_some() {
+                                theme::icons::CHECK
+                            } else {
+                                theme::icons::SAVE
+                            },
+                            if saved_until.is_some() {
+                                "Saved"
+                            } else {
+                                "Save settings"
+                            },
+                        ),
                     )
                     .clicked()
                 {
@@ -5455,6 +5384,40 @@ impl SpoonApp {
             if dialog.name.trim().is_empty() {
                 dialog.name_error = Some("Server name is required.".into());
             } else {
+                let mut appearance_ok = true;
+                if !valid_resource_pack_url(&dialog.resource_pack) {
+                    dialog.resource_pack_error =
+                        Some("Enter a valid http(s) URL or leave it empty.".into());
+                    appearance_ok = false;
+                }
+                let working_dir = self.servers[server_index].config.working_dir.clone();
+                if appearance_ok {
+                    if let Err(message) = apply_icon_choice(&working_dir, &dialog.icon) {
+                        dialog.icon_error = Some(message);
+                        appearance_ok = false;
+                    }
+                }
+                if appearance_ok {
+                    let mut entries = Vec::new();
+                    if !dialog.motd.is_empty() || dialog.had_motd {
+                        entries.push(("motd".to_string(), dialog.motd.clone()));
+                    }
+                    if !dialog.resource_pack.is_empty() || dialog.had_resource_pack {
+                        entries.push(("resource-pack".to_string(), dialog.resource_pack.clone()));
+                    }
+                    if !entries.is_empty() {
+                        if let Err(err) =
+                            set_properties(&working_dir.join("server.properties"), &entries)
+                        {
+                            dialog.resource_pack_error =
+                                Some(format!("Could not write server.properties: {err}"));
+                            appearance_ok = false;
+                        }
+                    }
+                }
+                if !appearance_ok {
+                    return;
+                }
                 let entry = &mut self.servers[server_index];
                 entry.config.name = dialog.name.trim().to_string();
                 entry.config.max_memory_mb = dialog.max_memory_mb;
@@ -5465,7 +5428,24 @@ impl SpoonApp {
                     _ => chosen_java,
                 };
                 should_save = true;
-                close = true;
+                // Stay on the settings page; re-baseline the draft against what
+                // was just written so follow-up saves behave like the first.
+                let dialog = self.settings_dialog.as_mut().unwrap();
+                dialog.had_motd = true;
+                dialog.had_resource_pack = true;
+                dialog.has_icon_file = match &dialog.icon {
+                    IconChoice::None => false,
+                    IconChoice::Keep => dialog.has_icon_file,
+                    IconChoice::Preset(_) | IconChoice::Custom(_) => true,
+                };
+                dialog.icon_previews.remove("current");
+                match matching_preset_icon(&working_dir) {
+                    Ok(preset) => dialog.current_icon_preset = preset,
+                    Err(err) => dialog.icon_error = Some(err),
+                }
+                dialog.icon = IconChoice::Keep;
+                dialog.saved_until = Some(Instant::now() + Duration::from_secs(2));
+                ui.ctx().request_repaint();
             }
         }
 
@@ -6060,12 +6040,6 @@ impl SpoonApp {
             "Backups",
             theme::PRIMARY,
         ));
-        ui.add_space(2.0);
-        ui.label(
-            egui::RichText::new(&self.servers[server_index].config.name)
-                .size(13.0)
-                .color(theme::TEXT_MUTED),
-        );
         ui.add_space(14.0);
 
         let Some(dialog) = self.backups_dialog.as_mut() else {
@@ -6767,6 +6741,22 @@ fn load_splash(ctx: &egui::Context) -> Option<Splash> {
 
 const LOGO_PNG: &[u8] = include_bytes!("../../../assets/images/Spoon-No-Border.png");
 const LOGO_HOVER_PNG: &[u8] = include_bytes!("../../../assets/images/Spoon-Hover.png");
+/// Built-in server icons offered in the appearance settings (64×64 PNGs,
+/// copied to the server folder as `server-icon.png` when picked).
+const PRESET_SERVER_ICONS: [(&str, &[u8]); 3] = [
+    (
+        "Spoon Classic",
+        include_bytes!("../../../assets/images/server-icons/Spoon-Classic.png"),
+    ),
+    (
+        "Spoon Alone",
+        include_bytes!("../../../assets/images/server-icons/Spoon-Alone.png"),
+    ),
+    (
+        "Blob Alone",
+        include_bytes!("../../../assets/images/server-icons/Blob-Alone.png"),
+    ),
+];
 const DISCORD_INVITE_URL: &str = "https://discord.gg/7UEZnsMMkf";
 const DISCORD_BUTTON_COLOR: egui::Color32 = egui::Color32::from_rgb(88, 101, 242);
 const KOFI_URL: &str = "https://ko-fi.com/pengucc";
@@ -6775,29 +6765,13 @@ const KOFI_BUTTON_COLOR: egui::Color32 = egui::Color32::from_rgb(0xFF, 0x5E, 0x5
 /// Window and taskbar icon.
 pub fn window_icon() -> egui::IconData {
     let img = image::load_from_memory_with_format(LOGO_PNG, image::ImageFormat::Png)
-        .map(|img| fit_square(&img.to_rgba8(), 256))
+        .map(|img| spoon_core::fit_square(&img.to_rgba8(), 256))
         .unwrap_or_else(|_| image::RgbaImage::new(1, 1));
     egui::IconData {
         width: img.width(),
         height: img.height(),
         rgba: img.into_raw(),
     }
-}
-
-/// Scales `img` to fit inside a `size`×`size` canvas, centered on transparent pixels.
-fn fit_square(img: &image::RgbaImage, size: u32) -> image::RgbaImage {
-    let scale = size as f32 / img.width().max(img.height()) as f32;
-    let w = ((img.width() as f32 * scale).round() as u32).max(1);
-    let h = ((img.height() as f32 * scale).round() as u32).max(1);
-    let scaled = image::imageops::resize(img, w, h, image::imageops::FilterType::Lanczos3);
-    let mut canvas = image::RgbaImage::new(size, size);
-    image::imageops::overlay(
-        &mut canvas,
-        &scaled,
-        ((size - w) / 2) as i64,
-        ((size - h) / 2) as i64,
-    );
-    canvas
 }
 
 fn load_logo(ctx: &egui::Context, bytes: &[u8], name: &str) -> Option<egui::TextureHandle> {
@@ -8480,6 +8454,761 @@ impl JavaDialog {
     }
 }
 
+/// Minecraft §-code colors (code → color, name) in palette order.
+const MOTD_COLORS: [(char, egui::Color32, &str); 16] = [
+    ('0', egui::Color32::from_rgb(0x00, 0x00, 0x00), "Black"),
+    ('1', egui::Color32::from_rgb(0x00, 0x00, 0xAA), "Dark Blue"),
+    ('2', egui::Color32::from_rgb(0x00, 0xAA, 0x00), "Dark Green"),
+    ('3', egui::Color32::from_rgb(0x00, 0xAA, 0xAA), "Dark Aqua"),
+    ('4', egui::Color32::from_rgb(0xAA, 0x00, 0x00), "Dark Red"),
+    (
+        '5',
+        egui::Color32::from_rgb(0xAA, 0x00, 0xAA),
+        "Dark Purple",
+    ),
+    ('6', egui::Color32::from_rgb(0xFF, 0xAA, 0x00), "Gold"),
+    ('7', egui::Color32::from_rgb(0xAA, 0xAA, 0xAA), "Gray"),
+    ('8', egui::Color32::from_rgb(0x55, 0x55, 0x55), "Dark Gray"),
+    ('9', egui::Color32::from_rgb(0x55, 0x55, 0xFF), "Blue"),
+    ('a', egui::Color32::from_rgb(0x55, 0xFF, 0x55), "Green"),
+    ('b', egui::Color32::from_rgb(0x55, 0xFF, 0xFF), "Aqua"),
+    ('c', egui::Color32::from_rgb(0xFF, 0x55, 0x55), "Red"),
+    (
+        'd',
+        egui::Color32::from_rgb(0xFF, 0x55, 0xFF),
+        "Light Purple",
+    ),
+    ('e', egui::Color32::from_rgb(0xFF, 0xFF, 0x55), "Yellow"),
+    ('f', egui::Color32::from_rgb(0xFF, 0xFF, 0xFF), "White"),
+];
+
+/// Formatting codes the palette offers besides colors: §l bold, §o italic,
+/// §n underline, §m strikethrough, §r reset (§k obfuscation has no static
+/// preview and is intentionally not insertable).
+const MOTD_FORMATS: [(char, &str, &str); 5] = [
+    ('l', "B", "Bold"),
+    ('o', "I", "Italic"),
+    ('n', "U", "Underline"),
+    ('m', "S", "Strikethrough"),
+    ('r', "R", "Reset"),
+];
+
+/// One run of MOTD text sharing the same formatting.
+#[derive(Debug, PartialEq)]
+struct MotdRun {
+    text: String,
+    color: Option<char>,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    strikethrough: bool,
+}
+
+/// Splits a MOTD into runs at `§` formatting codes. Unknown or trailing `§`
+/// characters stay literal.
+fn parse_motd(text: &str) -> Vec<MotdRun> {
+    let mut runs = Vec::new();
+    let mut run = MotdRun {
+        text: String::new(),
+        color: None,
+        bold: false,
+        italic: false,
+        underline: false,
+        strikethrough: false,
+    };
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{00a7}' {
+            if let Some(&code) = chars.peek() {
+                let known = MOTD_COLORS.iter().any(|(c, _, _)| *c == code)
+                    || MOTD_FORMATS.iter().any(|(c, _, _)| *c == code)
+                    || code == 'k';
+                if known {
+                    chars.next();
+                    if !run.text.is_empty() {
+                        let carry_color = run.color;
+                        runs.push(run);
+                        run = MotdRun {
+                            text: String::new(),
+                            color: carry_color,
+                            bold: false,
+                            italic: false,
+                            underline: false,
+                            strikethrough: false,
+                        };
+                    }
+                    match code {
+                        'k' => {}
+                        'l' => run.bold = true,
+                        'o' => run.italic = true,
+                        'n' => run.underline = true,
+                        'm' => run.strikethrough = true,
+                        // Color codes reset other formatting, like in game.
+                        'r' => {
+                            run.color = None;
+                            run.bold = false;
+                            run.italic = false;
+                            run.underline = false;
+                            run.strikethrough = false;
+                        }
+                        color => {
+                            run.color = Some(color);
+                            run.bold = false;
+                            run.italic = false;
+                            run.underline = false;
+                            run.strikethrough = false;
+                        }
+                    }
+                    continue;
+                }
+            }
+        }
+        run.text.push(c);
+    }
+    if !run.text.is_empty() {
+        runs.push(run);
+    }
+    runs
+}
+
+/// Layout job rendering a MOTD the way the in-game server list would (within
+/// egui's font limits: bold uses the heavier display font, obfuscation is
+/// shown unformatted).
+fn motd_layout_job(text: &str) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    for run in parse_motd(text) {
+        let color = run
+            .color
+            .and_then(|code| MOTD_COLORS.iter().find(|(c, _, _)| *c == code))
+            .map(|(_, color, _)| *color)
+            .unwrap_or(egui::Color32::WHITE);
+        let family = if run.bold {
+            theme::title_family()
+        } else {
+            egui::FontFamily::Proportional
+        };
+        job.append(
+            &run.text,
+            0.0,
+            egui::TextFormat {
+                font_id: egui::FontId::new(15.0, family),
+                color,
+                italics: run.italic,
+                underline: if run.underline {
+                    egui::Stroke::new(1.0_f32, color)
+                } else {
+                    egui::Stroke::NONE
+                },
+                strikethrough: if run.strikethrough {
+                    egui::Stroke::new(1.0_f32, color)
+                } else {
+                    egui::Stroke::NONE
+                },
+                ..Default::default()
+            },
+        );
+    }
+    job
+}
+
+/// Inserts `§code` into `text` at the char-index cursor (appends when the
+/// cursor is unknown or out of bounds).
+fn insert_motd_code(text: &mut String, cursor: Option<usize>, code: char) {
+    let len = text.chars().count();
+    let pos = cursor.unwrap_or(len).min(len);
+    let byte = text
+        .char_indices()
+        .nth(pos)
+        .map(|(i, _)| i)
+        .unwrap_or(text.len());
+    text.insert(byte, '\u{00a7}');
+    text.insert(byte + '\u{00a7}'.len_utf8(), code);
+}
+
+/// Resource pack URLs must be empty or an absolute http(s) URL.
+fn valid_resource_pack_url(url: &str) -> bool {
+    let url = url.trim();
+    url.is_empty() || url.starts_with("https://") || url.starts_with("http://")
+}
+
+/// Server name card with inline validation feedback.
+fn render_settings_name_card(ui: &mut egui::Ui, dialog: &mut SettingsDialog) {
+    theme::card().show(ui, |ui| {
+        ui.label(
+            egui::RichText::new("Name")
+                .size(12.0)
+                .color(theme::TEXT_MUTED),
+        );
+        let name_response =
+            ui.add(egui::TextEdit::singleline(&mut dialog.name).desired_width(f32::INFINITY));
+        if name_response.changed() {
+            dialog.name_error = None;
+            dialog.saved_until = None;
+        }
+        if let Some(err) = &dialog.name_error {
+            ui.label(egui::RichText::new(err).color(theme::ERROR));
+        }
+    });
+}
+
+/// Java runtime card: per-server override picked from the installed runtimes.
+fn render_settings_java_card(
+    ui: &mut egui::Ui,
+    dialog: &mut SettingsDialog,
+    running: bool,
+    app_java_label: &str,
+    installed: &[JavaRuntime],
+) {
+    theme::card().show(ui, |ui| {
+        ui.add_enabled_ui(!running, |ui| {
+            let mut draft = dialog.java_runtime.clone();
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                if ui
+                    .add(egui::RadioButton::new(draft.is_none(), ""))
+                    .clicked()
+                {
+                    draft = None;
+                }
+                ui.label(theme::icon(theme::icons::JAVA, 14.0).color(theme::TEXT_MUTED));
+                ui.label(
+                    egui::RichText::new(format!("App default ({app_java_label})"))
+                        .color(theme::TEXT),
+                );
+            });
+            for runtime in installed {
+                let id = Some(runtime.id.clone());
+                let is_selected = draft == id;
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+                    if ui.add(egui::RadioButton::new(is_selected, "")).clicked() {
+                        draft = id.clone();
+                    }
+                    ui.label(theme::icon(theme::icons::JAVA, 14.0).color(theme::PRIMARY));
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Java {} · {}",
+                            runtime.feature, runtime.release
+                        ))
+                        .color(theme::TEXT),
+                    );
+                });
+            }
+            if draft != dialog.java_runtime {
+                dialog.java_runtime = draft;
+            }
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new("Applied on next start")
+                    .size(12.0)
+                    .color(theme::TEXT_MUTED),
+            );
+        });
+    });
+}
+
+/// Memory card: min/max RAM steppers plus the live usage readout.
+fn render_settings_memory_card(
+    ui: &mut egui::Ui,
+    dialog: &mut SettingsDialog,
+    running: bool,
+    usage: &str,
+    effective_java_label: &str,
+) {
+    theme::card().show(ui, |ui| {
+        ui.add_enabled_ui(!running, |ui| {
+            memory_stepper(
+                ui,
+                "Minimum RAM",
+                &mut dialog.min_memory_mb,
+                128,
+                dialog.max_memory_mb.max(128),
+            );
+            ui.add_space(6.0);
+            memory_stepper(ui, "Maximum RAM", &mut dialog.max_memory_mb, 512, 65_536);
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(format!(
+                    "Applied on next start · launched with {effective_java_label}"
+                ))
+                .size(12.0)
+                .color(theme::TEXT_MUTED),
+            );
+        });
+        if running {
+            ui.label(
+                egui::RichText::new(format!("Using {usage} right now"))
+                    .size(12.5)
+                    .color(theme::PRIMARY),
+            );
+        }
+    });
+}
+
+/// MOTD field (multi-line, like the in-game server list) with a §-code
+/// palette and a live preview.
+fn render_motd_editor(ui: &mut egui::Ui, dialog: &mut SettingsDialog) {
+    let edit_id = egui::Id::new("settings_motd_edit");
+    let output = egui::TextEdit::multiline(&mut dialog.motd)
+        .id(edit_id)
+        .desired_rows(2)
+        .desired_width(f32::INFINITY)
+        .hint_text("A Minecraft Server")
+        .show(ui);
+    if let Some(range) = output.cursor_range {
+        let primary = range.primary.ccursor.index;
+        let secondary = range.secondary.ccursor.index;
+        dialog.motd_cursor = Some((primary.min(secondary), primary.max(secondary)));
+    }
+
+    ui.add_space(6.0);
+    render_motd_palette(ui, dialog);
+    ui.add_space(6.0);
+    egui::Frame::new()
+        .fill(theme::CONSOLE_BG)
+        .corner_radius(egui::CornerRadius::same(6))
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            if dialog.motd.is_empty() {
+                ui.label(
+                    egui::RichText::new("Minecraft server list preview")
+                        .size(15.0)
+                        .color(theme::TEXT_MUTED),
+                );
+            } else {
+                ui.label(motd_layout_job(&dialog.motd));
+            }
+        });
+}
+
+/// The MOTD formatting palette: color swatches plus style buttons. Picking
+/// one inserts its `§` code at the text cursor.
+fn render_motd_palette(ui: &mut egui::Ui, dialog: &mut SettingsDialog) {
+    let edit_id = egui::Id::new("settings_motd_edit");
+    let mut picked: Option<char> = None;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+        for (code, color, name) in MOTD_COLORS {
+            if motd_swatch(ui, code, color, name) {
+                picked = Some(code);
+            }
+        }
+        ui.add_space(4.0);
+        for (code, label, tooltip) in MOTD_FORMATS {
+            if motd_format_button(ui, label, tooltip) {
+                picked = Some(code);
+            }
+        }
+    });
+    if let Some(code) = picked {
+        // Insert in front of the highlighted text so the selection is colored.
+        let pos = dialog
+            .motd_cursor
+            .map(|(start, _)| start)
+            .unwrap_or_else(|| dialog.motd.chars().count());
+        let pos = pos.min(dialog.motd.chars().count());
+        insert_motd_code(&mut dialog.motd, Some(pos), code);
+        dialog.saved_until = None;
+        let cursor = pos + 2;
+        dialog.motd_cursor = Some((cursor, cursor));
+        // Keep the text cursor behind the inserted code so colors can be chained.
+        if let Some(mut state) = egui::widgets::text_edit::TextEditState::load(ui.ctx(), edit_id) {
+            state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::one(
+                    egui::text::CCursor::new(cursor),
+                )));
+            state.store(ui.ctx(), edit_id);
+        }
+    }
+}
+
+/// A MOTD palette color swatch; returns true when picked.
+fn motd_swatch(ui: &mut egui::Ui, code: char, color: egui::Color32, name: &str) -> bool {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
+    let fill = theme::animated_hover_fill(
+        ui,
+        response.id,
+        response.hovered(),
+        color,
+        color.linear_multiply(1.2),
+    );
+    ui.painter().rect_filled(rect, 4, fill);
+    ui.painter().rect_stroke(
+        rect.shrink(0.5),
+        4,
+        egui::Stroke::new(1.0_f32, theme::BORDER),
+        egui::StrokeKind::Inside,
+    );
+    response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(format!("{name} (§{code})"))
+        .clicked()
+}
+
+/// A MOTD palette formatting button (bold/italic/…); returns true when picked.
+fn motd_format_button(ui: &mut egui::Ui, label: &str, tooltip: &str) -> bool {
+    ui.add(
+        egui::Button::new(egui::RichText::new(label).size(12.5))
+            .min_size(egui::vec2(22.0, 18.0))
+            .corner_radius(4),
+    )
+    .on_hover_text(tooltip)
+    .clicked()
+}
+
+/// Resource pack URL field with inline validation feedback.
+fn render_resource_pack_field(ui: &mut egui::Ui, dialog: &mut SettingsDialog) {
+    ui.label(
+        egui::RichText::new("Resource Pack URL")
+            .size(12.0)
+            .color(theme::TEXT_MUTED),
+    );
+    let response = ui.add(
+        egui::TextEdit::singleline(&mut dialog.resource_pack)
+            .desired_width(f32::INFINITY)
+            .hint_text("https://example.com/resource-pack.zip"),
+    );
+    if response.changed() {
+        dialog.resource_pack_error = None;
+        dialog.saved_until = None;
+    }
+    if let Some(error) = &dialog.resource_pack_error {
+        ui.label(egui::RichText::new(error).color(theme::ERROR));
+    }
+}
+
+/// Server icon picker: a preview of the staged choice plus tiles for none, the
+/// current icon, the built-in presets and a custom image from the user's files.
+fn render_icon_selector(
+    ui: &mut egui::Ui,
+    ctx: &egui::Context,
+    dialog: &mut SettingsDialog,
+    working_dir: &Path,
+) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 12.0;
+        let (preview_rect, _) =
+            ui.allocate_exact_size(egui::vec2(64.0, 64.0), egui::Sense::hover());
+        ui.painter().rect_filled(preview_rect, 6, theme::CONSOLE_BG);
+        if let Some(texture) = staged_icon_texture(ctx, dialog, working_dir) {
+            paint_icon(ui.painter(), preview_rect.shrink(2.0), &texture);
+        }
+
+        ui.vertical(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+                if icon_option_tile(
+                    ui,
+                    "icon_none",
+                    "None",
+                    dialog.icon == IconChoice::None,
+                    |painter, rect| {
+                        painter.rect_filled(rect, 4, theme::CONSOLE_BG);
+                        painter.text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            theme::icons::XMARK,
+                            egui::FontId::new(14.0, theme::icon_family()),
+                            theme::TEXT_MUTED,
+                        );
+                    },
+                ) {
+                    dialog.icon = IconChoice::None;
+                    dialog.icon_error = None;
+                    dialog.saved_until = None;
+                }
+                if dialog.has_icon_file {
+                    let texture =
+                        icon_texture(ctx, dialog, "current", IconSource::Current(working_dir));
+                    let tooltip = dialog
+                        .current_icon_preset
+                        .map(|name| format!("Current ({name})"))
+                        .unwrap_or_else(|| "Current".to_string());
+                    let clicked = icon_option_tile(
+                        ui,
+                        "icon_current",
+                        &tooltip,
+                        dialog.icon == IconChoice::Keep,
+                        |painter, rect| {
+                            if let Some(texture) = &texture {
+                                paint_icon(painter, rect, texture);
+                            }
+                        },
+                    );
+                    if clicked {
+                        dialog.icon = IconChoice::Keep;
+                        dialog.icon_error = None;
+                        dialog.saved_until = None;
+                    }
+                }
+                for (name, bytes) in PRESET_SERVER_ICONS {
+                    if dialog.current_icon_preset == Some(name) {
+                        continue;
+                    }
+                    let texture = icon_texture(
+                        ctx,
+                        dialog,
+                        &format!("preset:{name}"),
+                        IconSource::Bytes(name, bytes),
+                    );
+                    let clicked = icon_option_tile(
+                        ui,
+                        &format!("icon_preset_{name}"),
+                        name,
+                        dialog.icon == IconChoice::Preset(name),
+                        |painter, rect| {
+                            if let Some(texture) = &texture {
+                                paint_icon(painter, rect, texture);
+                            }
+                        },
+                    );
+                    if clicked {
+                        dialog.icon = IconChoice::Preset(name);
+                        dialog.icon_error = None;
+                        dialog.saved_until = None;
+                    }
+                }
+                if icon_option_tile(
+                    ui,
+                    "icon_custom",
+                    "Custom",
+                    matches!(dialog.icon, IconChoice::Custom(_)),
+                    |painter, rect| {
+                        painter.text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            theme::icons::FOLDER_OPEN,
+                            egui::FontId::new(16.0, theme::icon_family()),
+                            theme::TEXT_MUTED,
+                        );
+                    },
+                ) {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("Images", &["png", "jpg", "jpeg"])
+                        .pick_file()
+                    {
+                        dialog
+                            .icon_previews
+                            .retain(|key, _| !key.starts_with("custom:"));
+                        dialog.icon = IconChoice::Custom(path);
+                        dialog.icon_error = None;
+                        dialog.saved_until = None;
+                    }
+                }
+            });
+            if let Some(error) = &dialog.icon_error {
+                ui.label(egui::RichText::new(error).color(theme::ERROR));
+            }
+        });
+    });
+}
+
+/// Texture for the icon choice currently staged in the dialog.
+fn staged_icon_texture(
+    ctx: &egui::Context,
+    dialog: &mut SettingsDialog,
+    working_dir: &Path,
+) -> Option<egui::TextureHandle> {
+    match dialog.icon.clone() {
+        IconChoice::Keep if dialog.has_icon_file => {
+            icon_texture(ctx, dialog, "current", IconSource::Current(working_dir))
+        }
+        IconChoice::Preset(name) => {
+            let bytes = preset_icon_bytes(name)?;
+            icon_texture(
+                ctx,
+                dialog,
+                &format!("preset:{name}"),
+                IconSource::Bytes(name, bytes),
+            )
+        }
+        IconChoice::Custom(path) => icon_texture(
+            ctx,
+            dialog,
+            &format!("custom:{}", path.display()),
+            IconSource::Custom(path),
+        ),
+        _ => None,
+    }
+}
+
+/// Where an icon texture's pixels come from.
+enum IconSource<'a> {
+    /// Embedded preset PNG bytes (name, bytes).
+    Bytes(&'a str, &'a [u8]),
+    /// The server's existing server-icon.png.
+    Current(&'a Path),
+    /// A user-picked image file (staged until save).
+    Custom(PathBuf),
+}
+
+impl IconSource<'_> {
+    fn load(self, ctx: &egui::Context, dialog: &mut SettingsDialog) -> Option<egui::TextureHandle> {
+        let invalid = |dialog: &mut SettingsDialog, what: String| {
+            dialog.icon_error = Some(format!("{what} is not a usable image."));
+            None
+        };
+        match self {
+            IconSource::Bytes(name, bytes) => icon_texture_from_bytes(ctx, name, bytes)
+                .or_else(|| invalid(dialog, "The preset icon".to_string())),
+            IconSource::Current(dir) => match read_server_icon(dir) {
+                Ok(Some(bytes)) => icon_texture_from_bytes(ctx, "server_icon_current", &bytes)
+                    .or_else(|| invalid(dialog, "The existing icon file".to_string())),
+                Ok(None) => None,
+                Err(err) => {
+                    dialog.icon_error = Some(format!("Could not read the icon: {err}"));
+                    None
+                }
+            },
+            IconSource::Custom(path) => match fs::read(&path) {
+                Ok(bytes) => icon_texture_from_bytes(ctx, "server_icon_custom", &bytes)
+                    .or_else(|| invalid(dialog, format!("{}", path.display()))),
+                Err(err) => {
+                    dialog.icon_error = Some(format!("Could not read {}: {err}", path.display()));
+                    None
+                }
+            },
+        }
+    }
+}
+
+/// Lazily decodes and caches a 64×64 texture for `source` under `key`.
+fn icon_texture(
+    ctx: &egui::Context,
+    dialog: &mut SettingsDialog,
+    key: &str,
+    source: IconSource<'_>,
+) -> Option<egui::TextureHandle> {
+    if let Some(texture) = dialog.icon_previews.get(key) {
+        return texture.clone();
+    }
+    let texture = source.load(ctx, dialog);
+    dialog
+        .icon_previews
+        .insert(key.to_string(), texture.clone());
+    texture
+}
+
+fn preset_icon_bytes(name: &str) -> Option<&'static [u8]> {
+    PRESET_SERVER_ICONS
+        .iter()
+        .find(|(preset, _)| *preset == name)
+        .map(|(_, bytes)| *bytes)
+}
+
+fn matching_preset_icon(working_dir: &Path) -> Result<Option<&'static str>, String> {
+    let Some(bytes) =
+        read_server_icon(working_dir).map_err(|err| format!("Could not read the icon: {err}"))?
+    else {
+        return Ok(None);
+    };
+    let current = image::load_from_memory(&bytes)
+        .map_err(|err| format!("Could not decode the current icon: {err}"))?
+        .to_rgba8();
+    let current = if current.dimensions() == (64, 64) {
+        current
+    } else {
+        spoon_core::fit_square(&current, 64)
+    };
+    for (name, bytes) in PRESET_SERVER_ICONS {
+        let preset = image::load_from_memory(bytes)
+            .map_err(|err| format!("Could not decode preset icon {name}: {err}"))?
+            .to_rgba8();
+        if current == spoon_core::fit_square(&preset, 64) {
+            return Ok(Some(name));
+        }
+    }
+    Ok(None)
+}
+
+/// Decodes image bytes into a 64×64 texture (aspect preserved, like the file
+/// that ends up next to the server jar).
+fn icon_texture_from_bytes(
+    ctx: &egui::Context,
+    name: &str,
+    bytes: &[u8],
+) -> Option<egui::TextureHandle> {
+    let image = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let image = spoon_core::fit_square(&image, 64);
+    let size = [image.width() as usize, image.height() as usize];
+    Some(ctx.load_texture(
+        name.to_string(),
+        egui::ColorImage::from_rgba_unmultiplied(size, image.as_raw()),
+        egui::TextureOptions::LINEAR,
+    ))
+}
+
+fn paint_icon(painter: &egui::Painter, rect: egui::Rect, texture: &egui::TextureHandle) {
+    painter.image(
+        texture.id(),
+        rect,
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        egui::Color32::WHITE,
+    );
+}
+
+/// A clickable icon option tile; `content` paints the tile interior and
+/// `tooltip` names the option on hover.
+fn icon_option_tile(
+    ui: &mut egui::Ui,
+    id_salt: &str,
+    tooltip: &str,
+    selected: bool,
+    content: impl FnOnce(&egui::Painter, egui::Rect),
+) -> bool {
+    let tile = egui::vec2(44.0, 44.0);
+    let (rect, response) = ui.allocate_exact_size(tile, egui::Sense::click());
+    let fill = theme::animated_hover_fill(
+        ui,
+        ui.id().with(id_salt),
+        response.hovered(),
+        theme::SURFACE_HOVER,
+        theme::SURFACE_ACTIVE,
+    );
+    ui.painter().rect_filled(rect, theme::RADIUS, fill);
+    content(ui.painter(), rect.shrink(5.0));
+    ui.painter().rect_stroke(
+        rect,
+        theme::RADIUS,
+        egui::Stroke::new(
+            if selected { 1.6_f32 } else { 1.0_f32 },
+            if selected {
+                theme::PRIMARY
+            } else {
+                theme::BORDER
+            },
+        ),
+        egui::StrokeKind::Inside,
+    );
+    response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(tooltip)
+        .clicked()
+}
+
+/// Applies the staged icon choice to the server folder when settings save.
+fn apply_icon_choice(working_dir: &Path, choice: &IconChoice) -> Result<(), String> {
+    match choice {
+        IconChoice::Keep => Ok(()),
+        IconChoice::None => clear_server_icon(working_dir)
+            .map_err(|err| format!("Could not remove the icon: {err}")),
+        IconChoice::Preset(name) => preset_icon_bytes(name)
+            .ok_or_else(|| "Unknown preset icon.".to_string())
+            .and_then(|bytes| {
+                write_server_icon(bytes, working_dir)
+                    .map_err(|err| format!("Could not save the icon: {err}"))
+            }),
+        IconChoice::Custom(path) => {
+            let bytes = fs::read(path)
+                .map_err(|err| format!("Could not read {}: {err}", path.display()))?;
+            write_server_icon(&bytes, working_dir)
+                .map_err(|err| format!("{} is not a usable image: {err}", path.display()))
+        }
+    }
+}
+
 struct SettingsDialog {
     server_id: String,
     name: String,
@@ -8494,10 +9223,60 @@ struct SettingsDialog {
     version_synced: bool,
     version_error: Option<String>,
     version_task: Option<Receiver<Result<(ServerType, String, Option<String>), String>>>,
+    /// MOTD draft (`motd` in server.properties, may hold § formatting codes).
+    motd: String,
+    /// Whether server.properties already had a `motd` key, so clearing the
+    /// draft can skip writing one and leave the server default untouched.
+    had_motd: bool,
+    /// Resource pack URL draft (`resource-pack` in server.properties).
+    resource_pack: String,
+    had_resource_pack: bool,
+    resource_pack_error: Option<String>,
+    /// Server icon draft; applied to `server-icon.png` on save.
+    icon: IconChoice,
+    /// Whether the server folder currently has an icon file.
+    has_icon_file: bool,
+    /// Preset whose pixels match the saved icon, so the picker can avoid a
+    /// duplicate option tile.
+    current_icon_preset: Option<&'static str>,
+    icon_error: Option<String>,
+    /// Lazily loaded 64×64 icon previews, keyed by source ("current",
+    /// "preset:<name>", "custom:<path>"); `None` marks a failed decode.
+    icon_previews: HashMap<String, Option<egui::TextureHandle>>,
+    /// Last MOTD selection as `(start, end)` char indices, retained while the
+    /// palette takes focus; palette codes insert at `start`.
+    motd_cursor: Option<(usize, usize)>,
+    /// Expiration time for the temporary save-button confirmation.
+    saved_until: Option<Instant>,
+}
+
+/// What to do with the server's `server-icon.png` when settings are saved.
+#[derive(Clone, PartialEq)]
+enum IconChoice {
+    /// Leave the existing icon file untouched.
+    Keep,
+    /// Remove the icon.
+    None,
+    /// Write one of the built-in preset icons.
+    Preset(&'static str),
+    /// Import a user-picked image file (resized to 64×64).
+    Custom(PathBuf),
 }
 
 impl SettingsDialog {
     fn new(config: &ServerConfig) -> Self {
+        let properties_path = config.working_dir.join("server.properties");
+        let motd = read_property(&properties_path, "motd");
+        let resource_pack = read_property(&properties_path, "resource-pack");
+        let has_icon_file = server_icon_path(&config.working_dir).is_file();
+        let (current_icon_preset, icon_error) = if has_icon_file {
+            match matching_preset_icon(&config.working_dir) {
+                Ok(preset) => (preset, None),
+                Err(err) => (None, Some(err)),
+            }
+        } else {
+            (None, None)
+        };
         Self {
             server_id: config.id.clone(),
             name: config.name.clone(),
@@ -8510,6 +9289,18 @@ impl SettingsDialog {
             version_synced: false,
             version_error: None,
             version_task: None,
+            motd: motd.clone().unwrap_or_default(),
+            had_motd: motd.is_some(),
+            resource_pack: resource_pack.clone().unwrap_or_default(),
+            had_resource_pack: resource_pack.is_some(),
+            resource_pack_error: None,
+            icon: IconChoice::Keep,
+            has_icon_file,
+            current_icon_preset,
+            icon_error,
+            icon_previews: HashMap::new(),
+            motd_cursor: None,
+            saved_until: None,
         }
     }
 
@@ -8912,8 +9703,9 @@ fn install_server_version(
 #[cfg(test)]
 mod tests {
     use super::{
-        file_path_breadcrumbs, format_duration, parse_online_player_list,
-        show_create_page_scroll_area, sidebar_footer_height, update_online_players,
+        file_path_breadcrumbs, format_duration, insert_motd_code, parse_motd,
+        parse_online_player_list, show_create_page_scroll_area, sidebar_footer_height,
+        update_online_players, valid_resource_pack_url, MotdRun,
     };
     use std::cell::{Cell, RefCell};
     use std::collections::BTreeSet;
@@ -9048,9 +9840,154 @@ mod tests {
     }
 
     #[test]
+    fn player_catalog_refresh_does_not_block_mutation_state() {
+        let dir = std::env::temp_dir().join(format!("spoon-player-refresh-{}", super::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut state = super::PlayerManagementState::new();
+        state.refresh(dir.clone(), false);
+
+        assert!(state.refresh_pending.is_some());
+        assert!(state.pending.is_none());
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while state.poll_refresh() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(state.catalog.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn formats_uptime_as_readable_elapsed_time() {
         assert_eq!(format_duration(Duration::from_secs(7)), "7s");
         assert_eq!(format_duration(Duration::from_secs(125)), "2m 05s");
         assert_eq!(format_duration(Duration::from_secs(3_723)), "1h 02m 03s");
+    }
+
+    fn run(text: &str, color: Option<char>) -> MotdRun {
+        MotdRun {
+            text: text.to_string(),
+            color,
+            bold: false,
+            italic: false,
+            underline: false,
+            strikethrough: false,
+        }
+    }
+
+    #[test]
+    fn motd_parser_splits_at_formatting_codes() {
+        assert_eq!(parse_motd("Plain"), vec![run("Plain", None)]);
+        assert_eq!(parse_motd("§aGreen"), vec![run("Green", Some('a'))]);
+        assert_eq!(
+            parse_motd("§aGreen §9Blue"),
+            vec![run("Green ", Some('a')), run("Blue", Some('9'))]
+        );
+        // A color code resets earlier formatting.
+        assert_eq!(parse_motd("§l§cB"), vec![run("B", Some('c'))]);
+        // Reset code and stray section signs stay literal.
+        assert_eq!(parse_motd("§rHi"), vec![run("Hi", None)]);
+        assert_eq!(parse_motd("50§ off §"), vec![run("50§ off §", None)]);
+        // Formatting flags carry per run.
+        let mut fancy = run("x", None);
+        fancy.bold = true;
+        fancy.italic = true;
+        fancy.underline = true;
+        fancy.strikethrough = true;
+        assert_eq!(parse_motd("§l§o§n§mx"), vec![fancy]);
+    }
+
+    #[test]
+    fn motd_code_inserts_at_char_cursor() {
+        let mut text = "AB".to_string();
+        insert_motd_code(&mut text, Some(1), 'a');
+        assert_eq!(text, "A§aB");
+        insert_motd_code(&mut text, None, 'l');
+        assert_eq!(text, "A§aB§l");
+        let mut beyond = "é".to_string();
+        insert_motd_code(&mut beyond, Some(9), 'c');
+        assert_eq!(beyond, "é§c");
+    }
+
+    /// Clicking palette swatches must put `§` codes into the MOTD draft — this
+    /// is the exact path that writes colors into server.properties on save.
+    #[test]
+    fn motd_palette_click_inserts_format_code() {
+        let dir = std::env::temp_dir().join(format!("spoon-motd-test-{}", super::new_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = super::ServerConfig::new(
+            super::new_id(),
+            "Test".into(),
+            dir.join("server.jar"),
+            dir.clone(),
+            4096,
+        );
+        let dialog = RefCell::new(super::SettingsDialog::new(&config));
+        dialog.borrow_mut().motd = "AB".into();
+        dialog.borrow_mut().motd_cursor = Some((1, 2));
+        let mut harness = egui_kittest::Harness::new(|ctx| {
+            super::theme::apply(ctx);
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(ctx, |ui| {
+                    super::render_motd_palette(ui, &mut dialog.borrow_mut());
+                });
+        });
+        harness.run_steps(1);
+
+        // Swatches are 18×18 with 4pt spacing; centers at (9 + 22·i, 9).
+        let click_swatch = |harness: &mut egui_kittest::Harness, index: usize| {
+            let pos = egui::pos2(9.0 + 22.0 * index as f32, 9.0);
+            harness
+                .input_mut()
+                .events
+                .push(egui::Event::PointerMoved(pos));
+            for pressed in [true, false] {
+                harness.input_mut().events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            harness.step();
+        };
+        click_swatch(&mut harness, 1);
+        assert_eq!(dialog.borrow().motd, "A\u{00a7}1B");
+        click_swatch(&mut harness, 2);
+        assert_eq!(dialog.borrow().motd, "A\u{00a7}1\u{00a7}2B");
+        assert_eq!(dialog.borrow().motd_cursor, Some((5, 5)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn matching_saved_preset_icon_is_detected() {
+        let dir = std::env::temp_dir().join(format!("spoon-preset-test-{}", super::new_id()));
+        super::write_server_icon(super::preset_icon_bytes("Spoon Classic").unwrap(), &dir).unwrap();
+        assert_eq!(
+            super::matching_preset_icon(&dir).unwrap(),
+            Some("Spoon Classic")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn social_brand_font_contains_discord_and_kofi_glyphs() {
+        let ctx = egui::Context::default();
+        super::theme::apply(&ctx);
+        let font_id = egui::FontId::new(16.0, super::theme::brand_icon_family());
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            assert!(ctx.fonts(|fonts| fonts.has_glyph(&font_id, '\u{f392}')));
+            assert!(ctx.fonts(|fonts| fonts.has_glyph(&font_id, '\u{e856}')));
+        });
+    }
+
+    #[test]
+    fn resource_pack_url_accepts_empty_or_http_urls_only() {
+        assert!(valid_resource_pack_url(""));
+        assert!(valid_resource_pack_url(" https://example.com/p.zip "));
+        assert!(valid_resource_pack_url("http://example.com/p.zip"));
+        assert!(!valid_resource_pack_url("example.com/p.zip"));
+        assert!(!valid_resource_pack_url("ftp://example.com/p.zip"));
     }
 }
