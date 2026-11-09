@@ -337,6 +337,7 @@ pub mod icons {
     pub const GAUGE_HIGH: &str = "\u{f625}";
     pub const TAG: &str = "\u{f02b}";
     pub const FOLDER: &str = "\u{f07b}";
+    pub const PUZZLE_PIECE: &str = "\u{f12e}";
     pub const FILE_LINES: &str = "\u{f15c}";
     pub const PEN: &str = "\u{f304}";
     pub const ARROW_UP: &str = "\u{f062}";

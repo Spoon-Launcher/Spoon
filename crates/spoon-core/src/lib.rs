@@ -9,6 +9,7 @@ pub mod files;
 pub mod highlight;
 pub mod java;
 pub mod mcjars;
+pub mod modrinth;
 pub mod players;
 pub mod port;
 pub mod properties;

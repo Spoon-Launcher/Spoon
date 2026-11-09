@@ -26,7 +26,9 @@ Cargo workspace (`resolver = "2"`) with two crates:
 | `.cargo/config.toml` | Static CRT on Windows only. |
 
 `spoon-core` modules: `config` (server/app settings persistence), `process` (server child process,
-log stream, state), `mcjars` (MCJars API: software/version lists, jar download), `java` (private JDK
+log stream, state), `mcjars` (MCJars API: software/version lists, jar download),
+`modrinth` (Modrinth API: plugin/mod search filtered by server software, version lists,
+installs into plugins//mods), `java` (private JDK
 runtimes), `eula`, `files` (file browser/editor helpers), `highlight` (syntax highlighting),
 `backup` (server folder snapshots under `Spoon/backups/<server-id>/`, with
 restore), `updater` (GitHub Releases

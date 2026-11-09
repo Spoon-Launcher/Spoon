@@ -553,3 +553,74 @@ fn create_page_picker_lists_fill_column_height() {
         "the create page scrolls: content is {content:.1} but the viewport is {viewport:.1}"
     );
 }
+
+/// The Plugins & Mods results must stay inside the window: the project rows
+/// live in a vertical ScrollArea below the page header, search and tab rows,
+/// so a full page of results scrolls instead of pushing content past the
+/// window edge. The scroll area reserves footer space so the page navigation
+/// below it is never cut off.
+#[test]
+fn content_results_scroll_inside_page() {
+    let panel_rect = Cell::new(None);
+    let scroll_rect = Cell::new(None);
+    let last_row_rect = Cell::new(None);
+    let pager_rect = Cell::new(None);
+    let mut harness = Harness::new(|ctx| {
+        theme::apply(ctx);
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::BACKGROUND)
+                    .inner_margin(egui::Margin::same(18)),
+            )
+            .show(ctx, |ui| {
+                panel_rect.set(Some(ui.max_rect()));
+                // Mirror render_content_page above the results: title row,
+                // search row, then the Browse/Installed tabs.
+                for height in [30.0, 30.0, 30.0] {
+                    ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), height),
+                        egui::Sense::hover(),
+                    );
+                    ui.add_space(8.0);
+                }
+                let response = egui::ScrollArea::vertical()
+                    .id_salt("content_results")
+                    .auto_shrink([false, false])
+                    .hscroll(false)
+                    .max_height((ui.available_height() - 44.0).max(120.0))
+                    .show(ui, |ui| {
+                        for index in 0..60 {
+                            let row = ui.add_sized(
+                                [ui.available_width(), 56.0],
+                                egui::Button::new(format!("result {index}")),
+                            );
+                            if index == 59 {
+                                last_row_rect.set(Some(row.rect));
+                            }
+                        }
+                    });
+                scroll_rect.set(Some(response.inner_rect));
+                ui.add_space(6.0);
+                pager_rect.set(Some(ui.add(egui::Button::new("Page 1 of 4")).rect));
+            });
+    });
+    harness.run();
+
+    let panel = panel_rect.get().expect("panel rendered");
+    let scroll = scroll_rect.get().expect("results scroll area rendered");
+    let last_row = last_row_rect.get().expect("result rows rendered");
+    let pager = pager_rect.get().expect("page navigation rendered");
+    assert!(
+        last_row.bottom() > scroll.bottom(),
+        "row stack (bottom {:.1}) should overflow the scroll area (bottom {:.1}) so it scrolls",
+        last_row.bottom(),
+        scroll.bottom()
+    );
+    assert!(
+        pager.bottom() <= panel.bottom() + 0.5,
+        "page navigation (bottom {:.1}) must stay inside the panel (bottom {:.1})",
+        pager.bottom(),
+        panel.bottom()
+    );
+}

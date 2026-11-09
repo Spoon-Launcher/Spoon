@@ -46,8 +46,8 @@ Status: ✅ Done · 🟡 In Progress · ⬜ Planned
 - ✅ Backups (backup the server root folder under Spoon/backups)
 - ⬜ Databases (Hook into a database server to allow creation of server specific databases)
 - ⬜ Desktop notifications (server up / down)
-- ⬜ Modrinth/Spigot Plugin Installer
-- ⬜ Modrinth/Curseforge Mod Installer
+- 🟡 Modrinth/Spigot Plugin Installer — Modrinth ✅ · Spigot ⬜
+- 🟡 Modrinth/Curseforge Mod Installer — Modrinth ✅ · Curseforge ⬜
 - ✅ Player Management
 - ✅ File Browser / File editor / Open server folder
 - ✅ Private Java runtimes

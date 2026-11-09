@@ -17,6 +17,10 @@ use spoon_core::files::{self, FileContent, FileEntry};
 use spoon_core::highlight::{self, Language, TokenKind};
 use spoon_core::java::{fetch_candidates, JavaCandidate, JavaRuntime, JavaStore};
 use spoon_core::mcjars::{McJarsClient, ServerType, SoftwareSnapshot, VersionEntry};
+use spoon_core::modrinth::{
+    self, ContentSupport, InstalledFile, ModrinthClient, ProjectHit, ProjectVersion, SearchIndex,
+    SearchResults,
+};
 use spoon_core::players::{
     add_ip_ban, add_player_ban, add_whitelist_player, fetch_player_skin, is_minecraft_username,
     parse_position_command_output, read_player_catalog, read_player_details, remove_ip_ban,
@@ -44,15 +48,22 @@ const SOFTWARE_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 /// Icon textures built per frame, so a burst of finished downloads can't stall one frame.
 const MAX_ICONS_PER_FRAME: usize = 4;
 const MAX_PLAYER_SKINS_IN_FLIGHT: usize = 4;
+const MAX_PROJECT_ICONS_IN_FLIGHT: usize = 6;
 const PLAYER_MANAGEMENT_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const BACKUP_STATUS_DURATION: Duration = Duration::from_secs(4);
+const CONTENT_NOTICE_DURATION: Duration = Duration::from_secs(4);
 /// Width of the dashboard icon rail: two 8px paddings, a 36px button and the border.
 const RAIL_STRIP_WIDTH: f32 = 8.0 + 36.0 + 8.0 + 2.0;
 /// The dashboard pages in rail order: page, icon glyph, hover label.
-const RAIL_PAGES: [(ServerPage, &str, &str); 5] = [
+const RAIL_PAGES: [(ServerPage, &str, &str); 6] = [
     (ServerPage::Overview, theme::icons::GAUGE_HIGH, "Overview"),
     (ServerPage::Files, theme::icons::FOLDER, "Files"),
     (ServerPage::Players, theme::icons::USERS, "Players"),
+    (
+        ServerPage::Plugins,
+        theme::icons::PUZZLE_PIECE,
+        "Plugins & Mods",
+    ),
     (ServerPage::Backups, theme::icons::ARCHIVE, "Backups"),
     (ServerPage::Settings, theme::icons::GEAR, "Settings"),
 ];
@@ -60,6 +71,8 @@ const RAIL_PAGES: [(ServerPage, &str, &str); 5] = [
 /// Result of one software icon download: the lowercase software name plus the raw PNG bytes.
 type IconFetch = (String, Result<Vec<u8>, String>);
 type PlayerSkinFetch = (String, Result<Vec<u8>, String>);
+/// Result of one Modrinth project icon download: project id plus image bytes.
+type ProjectIconFetch = (String, Result<Vec<u8>, String>);
 
 #[derive(Clone, Copy)]
 enum SocialButtonIcon {
@@ -224,6 +237,7 @@ enum ServerPage {
     Overview,
     Files,
     Players,
+    Plugins,
     Backups,
     Settings,
 }
@@ -522,6 +536,304 @@ impl PlayerManagementState {
     }
 }
 
+/// Modrinth projects are browsed in pages of this size; the results scroll
+/// inside one page and Prev/Next move between them.
+const SEARCH_PAGE_SIZE: usize = 25;
+/// Space the browse view reserves below the results scroll area so the status
+/// line and page navigation are never pushed out of the window.
+const CONTENT_FOOTER_HEIGHT: f32 = 44.0;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ContentTab {
+    Browse,
+    Installed,
+}
+
+/// Per-server state for the Plugins & Mods page: searching Modrinth, picking a
+/// version and tracking what's installed in the server folder.
+struct ContentBrowserState {
+    query: String,
+    sort: SearchIndex,
+    /// Restrict a project's versions to the server's Minecraft version.
+    match_version: bool,
+    tab: ContentTab,
+    searched: bool,
+    /// The support the current results were searched with; a software change
+    /// (version modal) re-triggers the browse.
+    searched_with: Option<ContentSupport>,
+    /// Current results page (0-based) within `total_hits`.
+    page: usize,
+    /// Bumped on every new search so the results scroll area resets to the top.
+    search_epoch: u64,
+    results: Vec<ProjectHit>,
+    total_hits: usize,
+    search_pending: Option<Receiver<Result<SearchResults, String>>>,
+    selected: Option<SelectedProject>,
+    install_pending: Option<Receiver<Result<String, String>>>,
+    /// `None` until the matching folder(s) have been scanned; cleared so the
+    /// next Installed view re-reads the disk.
+    installed: Option<Vec<InstalledFile>>,
+    installed_pending: Option<Receiver<Vec<InstalledFile>>>,
+    error: Option<String>,
+    notice: Option<String>,
+    notice_expires: Option<Instant>,
+}
+
+struct SelectedProject {
+    hit: ProjectHit,
+    versions: Vec<ProjectVersion>,
+    versions_pending: Option<Receiver<Result<Vec<ProjectVersion>, String>>>,
+}
+
+impl ContentBrowserState {
+    fn new() -> Self {
+        Self {
+            query: String::new(),
+            sort: SearchIndex::Downloads,
+            match_version: true,
+            tab: ContentTab::Browse,
+            searched: false,
+            searched_with: None,
+            page: 0,
+            search_epoch: 0,
+            results: Vec::new(),
+            total_hits: 0,
+            search_pending: None,
+            selected: None,
+            install_pending: None,
+            installed: None,
+            installed_pending: None,
+            error: None,
+            notice: None,
+            notice_expires: None,
+        }
+    }
+
+    /// Search Modrinth for the current page of results.
+    fn search(&mut self, support: ContentSupport) {
+        if self.search_pending.is_some() {
+            return;
+        }
+        self.error = None;
+        self.notice = None;
+        self.notice_expires = None;
+        self.selected = None;
+        let offset = self.page * SEARCH_PAGE_SIZE;
+        let query = self.query.trim().to_string();
+        let sort = self.sort;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = ModrinthClient::new()
+                .search(&query, &support, sort, offset, SEARCH_PAGE_SIZE)
+                .map_err(|err| err.to_string());
+            let _ = tx.send(result);
+        });
+        self.searched_with = Some(support);
+        self.search_epoch += 1;
+        self.search_pending = Some(rx);
+    }
+
+    /// Jump to another results page and fetch it.
+    fn go_to_page(&mut self, support: ContentSupport, page: usize) {
+        if page == self.page || self.search_pending.is_some() {
+            return;
+        }
+        self.page = page;
+        self.search(support);
+    }
+
+    /// Collect a finished search. Returns true while a search is in flight.
+    fn poll_search(&mut self) -> bool {
+        let result = self.search_pending.as_ref().map(Receiver::try_recv);
+        match result {
+            Some(Ok(Ok(page))) => {
+                self.search_pending = None;
+                self.searched = true;
+                self.total_hits = page.total_hits;
+                self.results = page.hits;
+            }
+            Some(Ok(Err(err))) => {
+                self.search_pending = None;
+                self.searched = true;
+                self.error = Some(err);
+            }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.search_pending = None;
+                self.searched = true;
+                self.error = Some("Modrinth search stopped unexpectedly.".to_string());
+            }
+            Some(Err(mpsc::TryRecvError::Empty)) => return true,
+            None => return false,
+        }
+        false
+    }
+
+    /// Open a project and start fetching its compatible versions.
+    fn open_project(
+        &mut self,
+        hit: ProjectHit,
+        support: ContentSupport,
+        game_version: Option<&str>,
+    ) {
+        self.selected = Some(SelectedProject {
+            hit,
+            versions: Vec::new(),
+            versions_pending: None,
+        });
+        self.load_versions(support, game_version);
+    }
+
+    fn load_versions(&mut self, support: ContentSupport, game_version: Option<&str>) {
+        let Some(selected) = &mut self.selected else {
+            return;
+        };
+        if selected.versions_pending.is_some() {
+            return;
+        }
+        selected.versions.clear();
+        let project = selected.hit.project_ref().to_string();
+        let game_version = game_version.map(str::to_string);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = ModrinthClient::new()
+                .versions(&project, &support, game_version.as_deref())
+                .map_err(|err| err.to_string());
+            let _ = tx.send(result);
+        });
+        selected.versions_pending = Some(rx);
+    }
+
+    /// Collect a finished version list. Returns true while it is in flight.
+    fn poll_versions(&mut self) -> bool {
+        let result = self
+            .selected
+            .as_ref()
+            .and_then(|selected| selected.versions_pending.as_ref())
+            .map(Receiver::try_recv);
+        match result {
+            Some(Ok(Ok(versions))) => {
+                let selected = self.selected.as_mut().expect("checked above");
+                selected.versions_pending = None;
+                selected.versions = versions;
+            }
+            Some(Ok(Err(err))) => {
+                let selected = self.selected.as_mut().expect("checked above");
+                selected.versions_pending = None;
+                self.error = Some(err);
+            }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                let selected = self.selected.as_mut().expect("checked above");
+                selected.versions_pending = None;
+                self.error = Some("Version list fetch stopped unexpectedly.".to_string());
+            }
+            Some(Err(mpsc::TryRecvError::Empty)) => return true,
+            None => return false,
+        }
+        false
+    }
+
+    /// Download a version's primary file into the folder the server's software
+    /// installs content into.
+    fn install(
+        &mut self,
+        version: &ProjectVersion,
+        project_type: &str,
+        working_dir: PathBuf,
+        support: ContentSupport,
+    ) {
+        if self.install_pending.is_some() {
+            return;
+        }
+        let Some(file) = version.primary_file() else {
+            self.error = Some(format!("{} has no downloadable files.", version.name));
+            return;
+        };
+        let dir = working_dir.join(support.install_dir_for(project_type));
+        let file = file.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = ModrinthClient::new()
+                .install_file(&file, &dir, &mut |_, _| {})
+                .map(|path| {
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                })
+                .map_err(|err| err.to_string());
+            let _ = tx.send(result);
+        });
+        self.install_pending = Some(rx);
+    }
+
+    /// Collect a finished install. Returns true while one is in flight.
+    fn poll_install(&mut self) -> bool {
+        let result = self.install_pending.as_ref().map(Receiver::try_recv);
+        match result {
+            Some(Ok(Ok(filename))) => {
+                self.install_pending = None;
+                self.set_notice(format!("Installed {filename}."));
+                self.error = None;
+                self.installed = None;
+            }
+            Some(Ok(Err(err))) => {
+                self.install_pending = None;
+                self.error = Some(err);
+            }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                self.install_pending = None;
+                self.error = Some("Install stopped unexpectedly.".to_string());
+            }
+            Some(Err(mpsc::TryRecvError::Empty)) => return true,
+            None => return false,
+        }
+        false
+    }
+
+    fn set_notice(&mut self, notice: String) {
+        self.notice = Some(notice);
+        self.notice_expires = Some(Instant::now() + CONTENT_NOTICE_DURATION);
+    }
+
+    fn poll_notice(&mut self, ctx: &egui::Context) {
+        let Some(expires) = self.notice_expires else {
+            return;
+        };
+        match expires.checked_duration_since(Instant::now()) {
+            Some(remaining) => ctx.request_repaint_after(remaining),
+            None => {
+                self.notice = None;
+                self.notice_expires = None;
+            }
+        }
+    }
+
+    fn refresh_installed(&mut self, working_dir: PathBuf, support: ContentSupport) {
+        if self.installed_pending.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(modrinth::installed_content(&working_dir, &support));
+        });
+        self.installed_pending = Some(rx);
+    }
+
+    fn poll_installed(&mut self) {
+        let result = self.installed_pending.as_ref().map(Receiver::try_recv);
+        match result {
+            Some(Ok(files)) => {
+                self.installed_pending = None;
+                self.installed = Some(files);
+            }
+            Some(Err(_)) => {
+                self.installed_pending = None;
+                self.error = Some("Installed list refresh stopped unexpectedly.".to_string());
+            }
+            None => {}
+        }
+    }
+}
+
 struct PlayerDetailsDialog {
     server_index: usize,
     name: String,
@@ -677,6 +989,7 @@ pub struct ServerEntry {
     online_players: BTreeSet<String>,
     max_players: u32,
     player_management: PlayerManagementState,
+    content_browser: ContentBrowserState,
 }
 
 impl ServerEntry {
@@ -699,6 +1012,7 @@ impl ServerEntry {
             online_players: BTreeSet::new(),
             max_players,
             player_management: PlayerManagementState::new(),
+            content_browser: ContentBrowserState::new(),
         }
     }
 
@@ -882,6 +1196,14 @@ pub struct SpoonApp {
     player_skin_rx: Receiver<PlayerSkinFetch>,
     player_details: Option<PlayerDetailsDialog>,
     software: SoftwareCache,
+    /// Modrinth project icons by project id; `None` marks a failed fetch so we
+    /// don't retry every frame.
+    project_icon_textures: HashMap<String, Option<egui::TextureHandle>>,
+    project_icon_pending: BTreeSet<String>,
+    /// Icons waiting for a fetch slot: (project id, icon url).
+    project_icon_requests: VecDeque<(String, String)>,
+    project_icon_tx: Sender<ProjectIconFetch>,
+    project_icon_rx: Receiver<ProjectIconFetch>,
 }
 
 impl SpoonApp {
@@ -928,6 +1250,7 @@ impl SpoonApp {
         let (icon_tx, icon_rx) = mpsc::channel();
         let (player_skin_tx, player_skin_rx) = mpsc::channel();
         let (update_tx, update_rx) = mpsc::channel();
+        let (project_icon_tx, project_icon_rx) = mpsc::channel();
         std::thread::spawn(move || {
             let result = UpdateClient::new(env!("CARGO_PKG_VERSION"))
                 .check()
@@ -990,6 +1313,11 @@ impl SpoonApp {
             player_skin_rx,
             player_details: None,
             software: SoftwareCache::new(),
+            project_icon_textures: HashMap::new(),
+            project_icon_pending: BTreeSet::new(),
+            project_icon_requests: VecDeque::new(),
+            project_icon_tx,
+            project_icon_rx,
         }
     }
 
@@ -1075,6 +1403,18 @@ impl SpoonApp {
                 if let Some(handle) = entry.handle.as_mut() {
                     if handle.state() != ServerState::Stopped {
                         handle.send_command("list");
+                    }
+                }
+            }
+            ServerPage::Plugins => {
+                let entry = &mut self.servers[index];
+                if let Some(support) =
+                    ContentSupport::for_software(entry.config.server_type.as_deref())
+                {
+                    let browser = &mut entry.content_browser;
+                    if browser.searched_with != Some(support) && browser.search_pending.is_none() {
+                        browser.page = 0;
+                        browser.search(support);
                     }
                 }
             }
@@ -1628,6 +1968,9 @@ impl eframe::App for SpoonApp {
         self.poll_icons(ctx);
         self.poll_software(ctx);
         self.ensure_icons();
+        self.poll_project_icons(ctx);
+        self.ensure_project_icons();
+        self.poll_content_browsers(ctx);
 
         self.render_sidebar(ctx);
         self.render_main_panel(ctx);
@@ -2215,6 +2558,7 @@ impl SpoonApp {
                             ServerPage::Overview => self.render_overview_page(ui, index),
                             ServerPage::Players => self.render_players_page(ui, index),
                             ServerPage::Files => self.render_files_page(ui, index),
+                            ServerPage::Plugins => self.render_content_page(ui, index),
                             ServerPage::Backups => self.render_backups_page(ui, index),
                             ServerPage::Settings => self.render_settings_page(ui, index),
                         }
@@ -3171,6 +3515,329 @@ impl SpoonApp {
         }
     }
 
+    /// Plugins & Mods page: browse Modrinth for content matching the server's
+    /// software and install it into the plugins/ or mods/ folder.
+    fn render_content_page(&mut self, ui: &mut egui::Ui, index: usize) {
+        let icon_textures = &self.project_icon_textures;
+        let icon_pending = &self.project_icon_pending;
+        let icon_queue = &self.project_icon_requests;
+        let entry = &mut self.servers[index];
+        let Some(support) = ContentSupport::for_software(entry.config.server_type.as_deref())
+        else {
+            ui.label(theme::title_with_icon(
+                theme::icons::PUZZLE_PIECE,
+                "Plugins & Mods",
+                theme::PRIMARY,
+            ));
+            ui.add_space(8.0);
+            theme::card().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                let software = software_name(&entry.config);
+                ui.label(
+                    egui::RichText::new(format!("{software} servers can't load plugins or mods."))
+                        .color(theme::TEXT),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Run a plugin- or mod-capable software (Paper, Fabric, Forge, …) to \
+                         browse Modrinth from here.",
+                    )
+                    .size(12.5)
+                    .color(theme::TEXT_MUTED),
+                );
+            });
+            return;
+        };
+        let label = support.label;
+        let game_version = entry.config.server_version.clone();
+        let working_dir = entry.config.working_dir.clone();
+        let browser = &mut entry.content_browser;
+
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), ui.spacing().interact_size.y),
+            egui::Layout::left_to_right(egui::Align::Min),
+            |ui| {
+                ui.label(theme::title_with_icon(
+                    theme::icons::PUZZLE_PIECE,
+                    label,
+                    theme::PRIMARY,
+                ));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add(theme::ghost_icon_button(
+                            theme::icons::FOLDER_OPEN,
+                            "Open Folder",
+                        ))
+                        .on_hover_text("Reveal the content folder in the file manager")
+                        .clicked()
+                    {
+                        open_directory(&working_dir.join(support.install_dir));
+                    }
+                });
+            },
+        );
+        ui.add_space(8.0);
+
+        let mut do_search = false;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            let field = ui.add(
+                egui::TextEdit::singleline(&mut browser.query)
+                    .hint_text("Search Modrinth…")
+                    .desired_width(220.0),
+            );
+            if field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                do_search = true;
+            }
+            let mut sort = browser.sort;
+            egui::ComboBox::from_id_salt("content_sort")
+                .selected_text(sort.label())
+                .width(170.0)
+                .show_ui(ui, |ui| {
+                    for option in SearchIndex::ALL {
+                        ui.selectable_value(&mut sort, option, option.label());
+                    }
+                });
+            if sort != browser.sort {
+                browser.sort = sort;
+                do_search = true;
+            }
+            if ui
+                .add(theme::primary_icon_button(theme::icons::SEARCH, "Search"))
+                .clicked()
+            {
+                do_search = true;
+            }
+            if browser.search_pending.is_some() {
+                ui.spinner();
+            }
+        });
+        if do_search {
+            browser.page = 0;
+            browser.search(support);
+        }
+        ui.add_space(4.0);
+
+        let mut tab = browser.tab;
+        ui.horizontal(|ui| {
+            let installed_label = match browser.installed.as_ref() {
+                Some(files) => format!("Installed ({})", files.len()),
+                None => "Installed".to_string(),
+            };
+            for (candidate, glyph, text) in [
+                (
+                    ContentTab::Browse,
+                    theme::icons::SEARCH,
+                    "Browse".to_string(),
+                ),
+                (
+                    ContentTab::Installed,
+                    theme::icons::FILE_ZIPPER,
+                    installed_label,
+                ),
+            ] {
+                if ui
+                    .add(theme::nav_tab(tab == candidate, glyph, &text))
+                    .clicked()
+                {
+                    tab = candidate;
+                }
+            }
+        });
+        if tab != browser.tab {
+            browser.tab = tab;
+            browser.error = None;
+            if tab == ContentTab::Installed {
+                browser.installed = None;
+            }
+        }
+        ui.add_space(10.0);
+
+        if let Some(error) = &browser.error {
+            ui.label(egui::RichText::new(error).color(theme::ERROR));
+            ui.add_space(6.0);
+        }
+        if let Some(notice) = &browser.notice {
+            ui.label(egui::RichText::new(notice).color(theme::PRIMARY));
+            ui.add_space(6.0);
+        }
+
+        match browser.tab {
+            ContentTab::Browse => {
+                if browser.selected.is_some() {
+                    render_content_versions(
+                        ui,
+                        browser,
+                        support,
+                        game_version.as_deref(),
+                        &working_dir,
+                    );
+                } else {
+                    let mut new_icon_requests = Vec::new();
+                    let hits = browser.results.clone();
+                    let mut open = None;
+                    egui::ScrollArea::vertical()
+                        .id_salt(("content_results", browser.page, browser.search_epoch))
+                        .auto_shrink([false, false])
+                        .hscroll(false)
+                        .max_height((ui.available_height() - CONTENT_FOOTER_HEIGHT).max(120.0))
+                        .show(ui, |ui| {
+                            for hit in &hits {
+                                let icon = icon_textures.get(&hit.id).and_then(Option::as_ref);
+                                if content_hit_row(ui, hit, icon) {
+                                    open = Some(hit.clone());
+                                }
+                                if let Some(url) = &hit.icon_url {
+                                    let known = icon_textures.contains_key(&hit.id)
+                                        || icon_pending.contains(&hit.id)
+                                        || icon_queue.iter().any(|(id, _)| id == &hit.id);
+                                    if !known {
+                                        new_icon_requests.push((hit.id.clone(), url.clone()));
+                                    }
+                                }
+                            }
+                        });
+                    self.project_icon_requests.extend(new_icon_requests);
+                    if let Some(hit) = open {
+                        browser.open_project(hit, support, game_version.as_deref());
+                    }
+                    if browser.search_pending.is_some() && browser.results.is_empty() {
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(
+                                egui::RichText::new("Searching Modrinth…").color(theme::TEXT_MUTED),
+                            );
+                        });
+                    }
+                    if browser.searched && browser.error.is_none() && browser.results.is_empty() {
+                        ui.label(
+                            egui::RichText::new("No projects found on Modrinth.")
+                                .color(theme::TEXT_MUTED),
+                        );
+                    }
+                    let pages = browser.total_hits.div_ceil(SEARCH_PAGE_SIZE);
+                    if pages > 1 {
+                        ui.add_space(6.0);
+                        let pending = browser.search_pending.is_some();
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            if ui
+                                .add_enabled(
+                                    !pending && browser.page > 0,
+                                    theme::ghost_icon_button(theme::icons::ARROW_LEFT, "Previous"),
+                                )
+                                .clicked()
+                            {
+                                browser.go_to_page(support, browser.page - 1);
+                            }
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Page {} of {pages}",
+                                    browser.page + 1
+                                ))
+                                .color(theme::TEXT_MUTED),
+                            );
+                            if ui
+                                .add_enabled(
+                                    !pending && browser.page + 1 < pages,
+                                    theme::secondary_icon_button(theme::icons::ARROW_RIGHT, "Next"),
+                                )
+                                .clicked()
+                            {
+                                browser.go_to_page(support, browser.page + 1);
+                            }
+                        });
+                    }
+                }
+            }
+            ContentTab::Installed => {
+                if browser.installed.is_none() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            egui::RichText::new("Reading the content folder…")
+                                .color(theme::TEXT_MUTED),
+                        );
+                    });
+                } else {
+                    let installed = browser.installed.clone().unwrap_or_default();
+                    if installed.is_empty() {
+                        ui.label(
+                            egui::RichText::new(
+                                "Nothing installed yet — browse Modrinth and install something.",
+                            )
+                            .color(theme::TEXT_MUTED),
+                        );
+                    } else {
+                        let mut remove = None;
+                        egui::ScrollArea::vertical()
+                            .id_salt("content_installed")
+                            .auto_shrink([false, false])
+                            .hscroll(false)
+                            .show(ui, |ui| {
+                                for file in &installed {
+                                    theme::card().show(ui, |ui| {
+                                        ui.set_width(ui.available_width());
+                                        ui.horizontal(|ui| {
+                                            ui.spacing_mut().item_spacing.x = 10.0;
+                                            ui.label(
+                                                theme::icon(theme::icons::FILE_ZIPPER, 15.0)
+                                                    .color(theme::TEXT_MUTED),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(&file.name).color(theme::TEXT),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(file.folder)
+                                                    .size(11.0)
+                                                    .color(theme::TEXT_MUTED),
+                                            );
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    if ui
+                                                        .add(theme::danger_icon_button(
+                                                            theme::icons::TRASH,
+                                                            "Remove",
+                                                        ))
+                                                        .on_hover_text(format!(
+                                                            "Delete {} from the {} folder",
+                                                            file.name, file.folder
+                                                        ))
+                                                        .clicked()
+                                                    {
+                                                        remove = Some(file.path.clone());
+                                                    }
+                                                },
+                                            );
+                                        });
+                                    });
+                                }
+                            });
+                        if let Some(path) = remove {
+                            match fs::remove_file(&path) {
+                                Ok(()) => {
+                                    browser.set_notice(format!(
+                                        "Removed {}.",
+                                        path.file_name()
+                                            .map(|name| name.to_string_lossy().into_owned())
+                                            .unwrap_or_default()
+                                    ));
+                                    browser.installed = None;
+                                }
+                                Err(err) => {
+                                    browser.error = Some(format!("Could not remove file: {err}"))
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn render_player_details(&mut self, ctx: &egui::Context) {
         let Some(mut dialog) = self.player_details.take() else {
             return;
@@ -3738,6 +4405,70 @@ impl SpoonApp {
         }
         if !self.player_skin_pending.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(200));
+        }
+    }
+
+    fn ensure_project_icons(&mut self) {
+        while self.project_icon_pending.len() < MAX_PROJECT_ICONS_IN_FLIGHT {
+            let Some((id, url)) = self.project_icon_requests.pop_front() else {
+                break;
+            };
+            if self.project_icon_textures.contains_key(&id)
+                || self.project_icon_pending.contains(&id)
+            {
+                continue;
+            }
+            self.project_icon_pending.insert(id.clone());
+            let tx = self.project_icon_tx.clone();
+            std::thread::spawn(move || {
+                let result = modrinth::fetch_project_icon(&url);
+                let _ = tx.send((id, result));
+            });
+        }
+    }
+
+    fn poll_project_icons(&mut self, ctx: &egui::Context) {
+        for _ in 0..MAX_PROJECT_ICONS_IN_FLIGHT {
+            let (id, result) = match self.project_icon_rx.try_recv() {
+                Ok(result) => result,
+                Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
+            };
+            self.project_icon_pending.remove(&id);
+            let texture = match result {
+                Ok(bytes) => load_icon_texture(ctx, &bytes, &format!("project_{id}")),
+                Err(err) => {
+                    eprintln!("Could not download Modrinth project icon for {id}: {err}");
+                    None
+                }
+            };
+            self.project_icon_textures.insert(id, texture);
+            ctx.request_repaint();
+        }
+        if !self.project_icon_pending.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(200));
+        }
+    }
+
+    /// Collect background work for every server's Plugins & Mods page.
+    fn poll_content_browsers(&mut self, ctx: &egui::Context) {
+        let mut pending = false;
+        for entry in &mut self.servers {
+            let browser = &mut entry.content_browser;
+            pending |= browser.poll_search();
+            pending |= browser.poll_versions();
+            pending |= browser.poll_install();
+            browser.poll_installed();
+            browser.poll_notice(ctx);
+            if browser.tab == ContentTab::Installed && browser.installed.is_none() {
+                if let Some(support) =
+                    ContentSupport::for_software(entry.config.server_type.as_deref())
+                {
+                    browser.refresh_installed(entry.config.working_dir.clone(), support);
+                }
+            }
+        }
+        if pending {
+            ctx.request_repaint_after(Duration::from_millis(150));
         }
     }
 
@@ -7379,6 +8110,368 @@ fn version_picker(
 /// A selectable row in the version picker: version id, a "LATEST" tag on the
 /// newest entry, accent highlight and a check mark when selected.
 /// Returns true when clicked.
+/// The version list for the project picked on the Plugins & Mods page: a back
+/// button, the project summary, an optional "match server version" filter and
+/// one installable row per version.
+fn render_content_versions(
+    ui: &mut egui::Ui,
+    browser: &mut ContentBrowserState,
+    support: ContentSupport,
+    game_version: Option<&str>,
+    working_dir: &Path,
+) {
+    let Some(mut selected) = browser.selected.take() else {
+        return;
+    };
+    let mut back = false;
+
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 10.0;
+        if ui
+            .add(theme::ghost_icon_button(theme::icons::ARROW_LEFT, "Back"))
+            .clicked()
+        {
+            back = true;
+        }
+        ui.label(
+            egui::RichText::new(&selected.hit.title)
+                .size(17.0)
+                .strong()
+                .color(theme::TEXT),
+        );
+        ui.label(
+            egui::RichText::new(format!(
+                "by {} · {} downloads",
+                selected.hit.author,
+                format_count(selected.hit.downloads)
+            ))
+            .size(12.5)
+            .color(theme::TEXT_MUTED),
+        );
+        if browser.install_pending.is_some() {
+            ui.spinner();
+            ui.label(egui::RichText::new("Installing…").color(theme::TEXT_MUTED));
+        }
+    });
+    if back {
+        browser.selected = None;
+        return;
+    }
+    ui.add_space(6.0);
+
+    let mut reload_versions = false;
+    if let Some(version) = game_version {
+        let mut match_version = browser.match_version;
+        ui.checkbox(
+            &mut match_version,
+            format!("Only versions for Minecraft {version}"),
+        );
+        if match_version != browser.match_version {
+            browser.match_version = match_version;
+            reload_versions = true;
+        }
+        ui.add_space(4.0);
+    }
+
+    let pending = selected.versions_pending.is_some();
+    if pending || reload_versions {
+        if reload_versions {
+            selected.versions.clear();
+            selected.versions_pending = None;
+        }
+        browser.selected = Some(selected);
+        if reload_versions {
+            browser.load_versions(
+                support,
+                if browser.match_version {
+                    game_version
+                } else {
+                    None
+                },
+            );
+        }
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label(egui::RichText::new("Loading versions…").color(theme::TEXT_MUTED));
+        });
+        return;
+    }
+    if selected.versions.is_empty() {
+        let detail = match (browser.match_version, game_version) {
+            (true, Some(version)) => {
+                format!("No versions of this project support Minecraft {version}.")
+            }
+            _ => "No versions compatible with this server.".to_string(),
+        };
+        browser.selected = Some(selected);
+        ui.label(egui::RichText::new(detail).color(theme::TEXT_MUTED));
+        return;
+    }
+
+    let installing = browser.install_pending.is_some();
+    let install = show_content_version_list(
+        ui,
+        &selected.versions,
+        &selected.hit.id,
+        &selected.hit.project_type,
+        support,
+        browser.match_version,
+        installing,
+    )
+    .inner;
+    if let Some(version) = install.and_then(|row| selected.versions.get(row)) {
+        browser.install(
+            version,
+            &selected.hit.project_type,
+            working_dir.to_path_buf(),
+            support,
+        );
+    }
+    browser.selected = Some(selected);
+}
+
+fn content_version_row_height(ui: &egui::Ui) -> f32 {
+    let subtitle_height = ui.fonts(|fonts| fonts.row_height(&egui::FontId::proportional(12.0)));
+    let title_height = ui
+        .text_style_height(&egui::TextStyle::Body)
+        .max(ui.spacing().interact_size.y);
+    let button_height = (ui.text_style_height(&egui::TextStyle::Button)
+        + 2.0 * ui.spacing().button_padding.y)
+        .max(ui.spacing().interact_size.y);
+    (title_height + 1.0 + subtitle_height).max(button_height) + theme::card().total_margin().sum().y
+}
+
+fn show_content_version_list(
+    ui: &mut egui::Ui,
+    versions: &[ProjectVersion],
+    project_id: &str,
+    project_type: &str,
+    support: ContentSupport,
+    match_version: bool,
+    installing: bool,
+) -> egui::scroll_area::ScrollAreaOutput<Option<usize>> {
+    let row_height = content_version_row_height(ui);
+    egui::ScrollArea::vertical()
+        .id_salt(("content_versions", project_id, match_version))
+        .auto_shrink([false, false])
+        .hscroll(false)
+        .show_rows(ui, row_height, versions.len(), |ui, range| {
+            let mut install = None;
+            for row in range {
+                ui.push_id(row, |ui| {
+                    if content_version_row(
+                        ui,
+                        &versions[row],
+                        project_type,
+                        support,
+                        installing,
+                        row_height,
+                    ) {
+                        install = Some(row);
+                    }
+                });
+            }
+            install
+        })
+}
+
+fn content_version_row(
+    ui: &mut egui::Ui,
+    version: &ProjectVersion,
+    project_type: &str,
+    support: ContentSupport,
+    installing: bool,
+    row_height: f32,
+) -> bool {
+    let mut install = false;
+    let card = theme::card();
+    let inner_height = row_height - card.total_margin().sum().y;
+    card.show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.set_min_height(inner_height);
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), inner_height),
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                let filename = version
+                    .primary_file()
+                    .map(|file| file.filename.as_str())
+                    .unwrap_or("");
+                if ui
+                    .add_enabled(
+                        !installing,
+                        theme::primary_icon_button(theme::icons::DOWNLOAD, "Install"),
+                    )
+                    .on_hover_text(format!(
+                        "Download {filename} into the {} folder",
+                        support.install_dir_for(project_type)
+                    ))
+                    .clicked()
+                {
+                    install = true;
+                }
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 1.0;
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        let channel_color = match version.channel {
+                            modrinth::VersionType::Release => theme::PRIMARY,
+                            modrinth::VersionType::Beta => theme::WARN,
+                            modrinth::VersionType::Alpha => theme::ERROR,
+                        };
+                        let channel = version.channel.label();
+                        let channel_width = ui.fonts(|fonts| {
+                            fonts
+                                .layout_no_wrap(
+                                    channel.to_string(),
+                                    egui::FontId::proportional(10.5),
+                                    channel_color,
+                                )
+                                .size()
+                                .x
+                        });
+                        let title_width = ui.fonts(|fonts| {
+                            fonts
+                                .layout_no_wrap(
+                                    version.version_number.clone(),
+                                    egui::TextStyle::Body.resolve(ui.style()),
+                                    theme::TEXT,
+                                )
+                                .size()
+                                .x
+                        });
+                        let title_width =
+                            title_width.min((ui.available_width() - channel_width - 6.0).max(0.0));
+                        ui.add_sized(
+                            [title_width, ui.text_style_height(&egui::TextStyle::Body)],
+                            egui::Label::new(
+                                egui::RichText::new(&version.version_number)
+                                    .strong()
+                                    .color(theme::TEXT),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(&version.version_number);
+                        ui.label(egui::RichText::new(channel).size(10.5).color(channel_color));
+                    });
+                    let subtitle = format!(
+                        "{} · {} · {} downloads",
+                        version.loaders.join(", "),
+                        version.game_versions.join(", "),
+                        format_count(version.downloads)
+                    );
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&subtitle)
+                                .size(12.0)
+                                .color(theme::TEXT_MUTED),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(subtitle);
+                });
+            },
+        );
+    });
+    install
+}
+
+/// A Modrinth project row: icon, title, author summary and description.
+/// Returns true when the row was clicked.
+fn content_hit_row(
+    ui: &mut egui::Ui,
+    hit: &ProjectHit,
+    icon: Option<&egui::TextureHandle>,
+) -> bool {
+    let mut clicked = false;
+    theme::card().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            let (rect, response) =
+                ui.allocate_exact_size(egui::vec2(40.0, 40.0), egui::Sense::click());
+            let painter = ui.painter();
+            match icon {
+                Some(texture) => {
+                    painter.image(
+                        texture.id(),
+                        rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                }
+                None => {
+                    painter.rect_filled(rect, 6.0, theme::SURFACE_HOVER);
+                    painter.text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        theme::icons::PUZZLE_PIECE,
+                        egui::FontId::new(18.0, theme::icon_family()),
+                        theme::TEXT_MUTED,
+                    );
+                }
+            }
+            clicked |= response.clicked();
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 1.0;
+                let title = ui
+                    .label(
+                        egui::RichText::new(&hit.title)
+                            .strong()
+                            .size(14.5)
+                            .color(theme::TEXT),
+                    )
+                    .on_hover_text(&hit.title);
+                clicked |= title.clicked();
+                ui.label(
+                    egui::RichText::new(format!(
+                        "by {} · {} · {} downloads",
+                        hit.author,
+                        hit.project_type,
+                        format_count(hit.downloads)
+                    ))
+                    .size(11.5)
+                    .color(theme::TEXT_MUTED),
+                );
+                let description = truncate_to_width(
+                    ui,
+                    &hit.description,
+                    egui::FontId::proportional(12.0),
+                    (ui.available_width() * 0.75).clamp(200.0, 560.0),
+                );
+                let desc = ui.label(
+                    egui::RichText::new(description)
+                        .size(12.0)
+                        .color(theme::TEXT_MUTED),
+                );
+                clicked |= desc.clicked();
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let button = ui
+                    .add(theme::secondary_icon_button(
+                        theme::icons::ARROW_RIGHT,
+                        "Versions",
+                    ))
+                    .on_hover_text("Pick a version to install");
+                clicked |= button.clicked();
+            });
+        });
+    });
+    clicked
+}
+
+/// Compact human-readable count: 1_234_567 -> "1.2M", 3_400 -> "3.4K".
+fn format_count(count: u64) -> String {
+    if count >= 1_000_000 {
+        format!("{:.1}M", count as f64 / 1_000_000.0)
+    } else if count >= 1_000 {
+        format!("{:.1}K", count as f64 / 1_000.0)
+    } else {
+        count.to_string()
+    }
+}
+
 fn version_row(ui: &mut egui::Ui, version: &str, selected: bool, is_latest: bool) -> bool {
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 26.0), egui::Sense::click());
@@ -9712,6 +10805,179 @@ mod tests {
     use std::path::Path;
     use std::time::Duration;
 
+    fn content_version(index: usize) -> spoon_core::modrinth::ProjectVersion {
+        spoon_core::modrinth::ProjectVersion {
+            id: index.to_string(),
+            name: format!("Version {index}"),
+            version_number: format!("release-number-{index}"),
+            channel: spoon_core::modrinth::VersionType::Release,
+            loaders: vec!["paper".to_string()],
+            game_versions: vec!["1.21".to_string()],
+            downloads: 123,
+            files: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn content_version_list_virtualizes_and_installs_old_releases() {
+        use egui_kittest::kittest::Queryable;
+
+        let versions: Vec<_> = (0..1000).map(content_version).collect();
+        let support = super::ContentSupport::for_software(Some("paper")).unwrap();
+        let scroll_id = Cell::new(None);
+        let content_height = Cell::new(0.0);
+        let clicked = Cell::new(None);
+        let project_id = Cell::new("project-a");
+        let fonts_ready = Cell::new(false);
+        let mut harness = egui_kittest::Harness::new(|ctx| {
+            if !fonts_ready.replace(true) {
+                super::theme::apply(ctx);
+                ctx.request_repaint();
+                return;
+            }
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let output = super::show_content_version_list(
+                    ui,
+                    &versions,
+                    project_id.get(),
+                    "plugin",
+                    support,
+                    true,
+                    false,
+                );
+                scroll_id.set(Some(output.id));
+                content_height.set(output.content_size.y);
+                if output.inner.is_some() {
+                    clicked.set(output.inner);
+                }
+            });
+        });
+        harness.run();
+        assert!(harness.query_by_label("release-number-0").is_some());
+        assert!(harness.query_by_label("release-number-999").is_none());
+        assert!(
+            harness.query_all_by_label_contains("Install").count() < 30,
+            "only visible release rows should be rendered"
+        );
+
+        let id = scroll_id.get().unwrap();
+        let mut state = egui::scroll_area::State::load(&harness.ctx, id).unwrap();
+        state.offset.y = content_height.get();
+        state.store(&harness.ctx, id);
+        harness.ctx.request_repaint();
+        harness.run();
+        assert!(harness.query_by_label("release-number-0").is_none());
+        assert!(harness.query_by_label("release-number-999").is_some());
+        harness
+            .get_all_by_label_contains("Install")
+            .last()
+            .unwrap()
+            .click();
+        harness.run();
+        assert_eq!(clicked.get(), Some(999));
+
+        project_id.set("project-b");
+        harness.ctx.request_repaint();
+        harness.run();
+        assert!(harness.query_by_label("release-number-0").is_some());
+    }
+
+    #[test]
+    fn content_version_rows_keep_fixed_height_with_long_text() {
+        let mut version = content_version(0);
+        version.version_number = "A very long version name ".repeat(30);
+        version.game_versions = vec!["1.21".to_string(); 100];
+        let support = super::ContentSupport::for_software(Some("paper")).unwrap();
+        let heights = RefCell::new(Vec::new());
+        let expected = Cell::new(0.0);
+        let fonts_ready = Cell::new(false);
+        let mut harness = egui_kittest::Harness::new(|ctx| {
+            if !fonts_ready.replace(true) {
+                super::theme::apply(ctx);
+                ctx.request_repaint();
+                return;
+            }
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.set_max_width(300.0);
+                let row_height = super::content_version_row_height(ui);
+                expected.set(row_height);
+                let mut row_heights = heights.borrow_mut();
+                row_heights.clear();
+                for _ in 0..2 {
+                    let row = ui.scope(|ui| {
+                        super::content_version_row(
+                            ui, &version, "plugin", support, false, row_height,
+                        )
+                    });
+                    row_heights.push(row.response.rect.height());
+                }
+            });
+        });
+        harness.run();
+        for height in heights.borrow().iter() {
+            assert!(
+                (height - expected.get()).abs() < 1.0,
+                "row height {height} does not match expected {}",
+                expected.get()
+            );
+        }
+    }
+
+    #[test]
+    fn content_version_row_aligns_labels_next_to_title() {
+        use egui_kittest::kittest::Queryable;
+
+        for width in [300.0, 1600.0] {
+            let version = content_version(0);
+            let support = super::ContentSupport::for_software(Some("paper")).unwrap();
+            let fonts_ready = Cell::new(false);
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(width, 300.0))
+                .build(|ctx| {
+                    if !fonts_ready.replace(true) {
+                        super::theme::apply(ctx);
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let height = super::content_version_row_height(ui);
+                        super::content_version_row(ui, &version, "plugin", support, false, height);
+                    });
+                });
+            harness.run();
+            let title = harness
+                .get_by_label("release-number-0")
+                .raw_bounds()
+                .unwrap();
+            let channel = harness.get_by_label("Release").raw_bounds().unwrap();
+            let subtitle = harness
+                .get_by_label("paper · 1.21 · 123 downloads")
+                .raw_bounds()
+                .unwrap();
+            let install = harness
+                .get_by_label_contains("Install")
+                .raw_bounds()
+                .unwrap();
+
+            assert!(
+                (title.x0 - subtitle.x0).abs() <= 2.0,
+                "version and subtitle must align left at width {width}: {title:?}, {subtitle:?}"
+            );
+            assert!(
+                title.x1 - title.x0 < 200.0,
+                "short version labels must not fill the card at width {width}: {title:?}"
+            );
+            assert!(
+                channel.x0 >= title.x1 && channel.x0 - title.x1 <= 10.0,
+                "release channel must sit next to the version at width {width}: {title:?}, {channel:?}"
+            );
+            assert!(
+                channel.x1 < install.x0,
+                "labels must not overlap Install at width {width}: {channel:?}, {install:?}"
+            );
+        }
+    }
+
     #[test]
     fn file_breadcrumbs_include_only_server_folder_ancestors() {
         let root = Path::new("server");
@@ -9743,6 +11009,32 @@ mod tests {
             breadcrumbs,
             vec![(root.to_path_buf(), "Survival".to_string())]
         );
+    }
+
+    #[test]
+    fn modrinth_icon_formats_decode() {
+        // Modrinth serves project icons mostly as WebP and GIF; the `image`
+        // features in Cargo.toml must stay enabled or those icons render as
+        // placeholders.
+        let pixel = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            1,
+            1,
+            image::Rgb([0x8f, 0xe3, 0xb0]),
+        ));
+        for format in [
+            image::ImageFormat::Png,
+            image::ImageFormat::Gif,
+            image::ImageFormat::WebP,
+        ] {
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            pixel
+                .write_to(&mut bytes, format)
+                .unwrap_or_else(|err| panic!("encode {format:?}: {err}"));
+            assert!(
+                image::load_from_memory(&bytes.into_inner()).is_ok(),
+                "{format:?} should decode"
+            );
+        }
     }
 
     #[test]
@@ -9862,6 +11154,19 @@ mod tests {
         assert_eq!(format_duration(Duration::from_secs(7)), "7s");
         assert_eq!(format_duration(Duration::from_secs(125)), "2m 05s");
         assert_eq!(format_duration(Duration::from_secs(3_723)), "1h 02m 03s");
+    }
+
+    #[test]
+    fn content_browser_notice_expires() {
+        let mut browser = super::ContentBrowserState::new();
+        browser.set_notice("Installed example.jar.".to_string());
+        assert!(browser.notice.is_some());
+
+        browser.notice_expires = Some(std::time::Instant::now() - Duration::from_secs(1));
+        browser.poll_notice(&egui::Context::default());
+
+        assert!(browser.notice.is_none());
+        assert!(browser.notice_expires.is_none());
     }
 
     fn run(text: &str, color: Option<char>) -> MotdRun {
