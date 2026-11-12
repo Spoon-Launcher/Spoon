@@ -23,7 +23,8 @@ Join the [Discord](https://discord.gg/7UEZnsMMkf) for updates and to talk with t
 - **Monitor activity** — check CPU and memory usage, uptime, online players, and the server IP.
 - **Manage players** — browse live online and offline player lists
 - **Install plugins & mods** — browse Modrinth and download content matching your server's software.
-- **Work with server files** — browse and edit files without leaving Spoon.
+- **Work with server files** — browse, edit, move, upload, and pull files from direct links, and
+  uncompress archives without leaving Spoon.
 - **Back up server files** — snapshot a server's folder into Spoon's backups
   directory and restore a snapshot later.
 - **Built In Updates** — quickly and easily update from within the app.

@@ -2815,6 +2815,13 @@ impl SpoonApp {
         };
         let local_addr = format!("{local_ip}:{port}");
         let local_only = format!("localhost:{port}");
+        let copied_id = egui::Id::new(("server_addr_copied", index));
+        let copied_until: Option<Instant> = ui.data(|d| d.get_temp(copied_id));
+        let copied = copied_until.is_some_and(|until| until > now);
+        if let Some(until) = copied_until.filter(|until| *until > now) {
+            ui.ctx()
+                .request_repaint_after(until.saturating_duration_since(now));
+        }
         theme::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -2838,12 +2845,31 @@ impl SpoonApp {
                         .color(theme::TEXT_MUTED),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add(icon_toolbar_button(theme::icons::COPY))
-                        .on_hover_text("Copy address for players on your network")
-                        .clicked()
-                    {
+                    let copy_clicked = ui
+                        .add(icon_toolbar_button(if copied {
+                            theme::icons::CHECK
+                        } else {
+                            theme::icons::COPY
+                        }))
+                        .on_hover_text(if copied {
+                            "Address copied!"
+                        } else {
+                            "Copy address for players on your network"
+                        })
+                        .clicked();
+                    if copy_clicked {
                         ui.ctx().copy_text(local_addr.clone());
+                        ui.data_mut(|d| {
+                            d.insert_temp(copied_id, Instant::now() + Duration::from_secs(2))
+                        });
+                        ui.ctx().request_repaint_after(Duration::from_secs(2));
+                    }
+                    if copied {
+                        ui.label(
+                            egui::RichText::new("Copied!")
+                                .size(12.0)
+                                .color(theme::PRIMARY),
+                        );
                     }
                 });
             });
@@ -6208,55 +6234,110 @@ impl SpoonApp {
         let mut save_file = false;
         let mut should_save = false;
 
-        ui.label(theme::title_with_icon(
-            theme::icons::FOLDER,
-            "Files",
-            theme::PRIMARY,
-        ));
-        ui.add_space(2.0);
+        self.files_dialog.as_mut().unwrap().poll_background_tasks();
+        let dialog = self.files_dialog.as_ref().unwrap();
+        if dialog.upload_task.is_some()
+            || dialog.uncompress_task.is_some()
+            || dialog.pull_query_task.is_some()
+            || dialog.pull_download_task.is_some()
+        {
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
+        }
         let breadcrumbs = {
             let dialog = self.files_dialog.as_ref().unwrap();
             file_path_breadcrumbs(&dialog.root, &dialog.current, &server_name)
         };
         let mut breadcrumb_target = None;
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
-            ui.spacing_mut().button_padding = egui::vec2(2.0, 0.0);
-            ui.label(egui::RichText::new("/").size(13.0).color(theme::TEXT_MUTED));
-            for (index, (path, name)) in breadcrumbs.iter().enumerate() {
-                if index > 0 {
-                    ui.label(egui::RichText::new("/").size(13.0).color(theme::TEXT_MUTED));
-                }
-                if index + 1 == breadcrumbs.len() {
-                    ui.label(
-                        egui::RichText::new(name)
-                            .size(13.0)
-                            .color(theme::TEXT_MUTED),
-                    );
-                } else {
-                    let button = theme::animated_button(
-                        egui::Button::new(
-                            egui::RichText::new(name.as_str())
+        let mut open_pull_dialog = false;
+        let mut create_file = false;
+        let mut create_folder = false;
+        let mut choose_upload = false;
+        ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                ui.spacing_mut().button_padding = egui::vec2(2.0, 0.0);
+                ui.label(egui::RichText::new("/").size(13.0).color(theme::TEXT_MUTED));
+                for (index, (path, name)) in breadcrumbs.iter().enumerate() {
+                    if index > 0 {
+                        ui.label(egui::RichText::new("/").size(13.0).color(theme::TEXT_MUTED));
+                    }
+                    if index + 1 == breadcrumbs.len() {
+                        ui.label(
+                            egui::RichText::new(name)
                                 .size(13.0)
-                                .color(theme::TEXT),
-                        ),
-                        egui::Color32::TRANSPARENT,
-                        theme::SURFACE_HOVER,
-                        egui::Stroke::NONE,
-                        egui::Stroke::NONE,
-                    );
-                    if ui
-                        .add(button)
-                        .on_hover_cursor(egui::CursorIcon::PointingHand)
-                        .clicked()
-                    {
-                        breadcrumb_target = Some(path.clone());
+                                .color(theme::TEXT_MUTED),
+                        );
+                    } else {
+                        let button = theme::animated_button(
+                            egui::Button::new(
+                                egui::RichText::new(name.as_str())
+                                    .size(13.0)
+                                    .color(theme::TEXT),
+                            ),
+                            egui::Color32::TRANSPARENT,
+                            theme::SURFACE_HOVER,
+                            egui::Stroke::NONE,
+                            egui::Stroke::NONE,
+                        );
+                        if ui
+                            .add(button)
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .clicked()
+                        {
+                            breadcrumb_target = Some(path.clone());
+                        }
                     }
                 }
-            }
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if ui.add(theme::primary_button("New File")).clicked() {
+                        create_file = true;
+                    }
+                    if ui.add(theme::primary_button("Upload")).clicked() {
+                        choose_upload = true;
+                    }
+                    if ui
+                        .add(theme::secondary_button("Create Directory"))
+                        .clicked()
+                    {
+                        create_folder = true;
+                    }
+                    if ui.add(theme::secondary_button("Pull File")).clicked() {
+                        open_pull_dialog = true;
+                    }
+                });
+            });
         });
         if let Some(target) = breadcrumb_target {
             self.files_dialog.as_mut().unwrap().navigate_to(&target);
+        }
+        {
+            let dialog = self.files_dialog.as_mut().unwrap();
+            if create_file {
+                dialog.pending = Some(PendingFileOp::NewFile);
+                dialog.pending_name.clear();
+                dialog.confirm_delete = None;
+            }
+            if create_folder {
+                dialog.pending = Some(PendingFileOp::NewFolder);
+                dialog.pending_name.clear();
+                dialog.confirm_delete = None;
+            }
+            if open_pull_dialog && !dialog.pull_dialog_open {
+                dialog.open_pull_dialog();
+            }
+            if choose_upload {
+                if let Some(source) = rfd::FileDialog::new()
+                    .set_title("Upload a file")
+                    .pick_file()
+                {
+                    dialog.start_upload(source);
+                }
+            }
+            if dialog.upload_task.is_some() {
+                ui.ctx().request_repaint_after(Duration::from_millis(100));
+            }
         }
         ui.add_space(14.0);
         // Both panes take the height left above the footer.
@@ -6269,44 +6350,15 @@ impl SpoonApp {
                 let dialog = self.files_dialog.as_mut().unwrap();
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
-                    if ui
-                        .add(icon_toolbar_button(theme::icons::ROTATE))
-                        .on_hover_text("Refresh")
-                        .clicked()
-                    {
+                    ui.spacing_mut().button_padding = egui::vec2(8.0, 6.0);
+                    if ui.button("Refresh").clicked() {
                         dialog.refresh();
                     }
-                    if ui
-                        .add(icon_toolbar_button(theme::icons::FOLDER_OPEN))
-                        .on_hover_text("Open server folder")
-                        .clicked()
-                    {
+                    if ui.button("Open Folder").clicked() {
                         open_directory(&server_dir);
                     }
-                    if ui
-                        .add(icon_toolbar_button(theme::icons::FILE_CIRCLE_PLUS))
-                        .on_hover_text("New file")
-                        .clicked()
-                    {
-                        dialog.pending = Some(PendingFileOp::NewFile);
-                        dialog.pending_name.clear();
-                        dialog.confirm_delete = None;
-                    }
-                    if ui
-                        .add(icon_toolbar_button(theme::icons::FOLDER_PLUS))
-                        .on_hover_text("New folder")
-                        .clicked()
-                    {
-                        dialog.pending = Some(PendingFileOp::NewFolder);
-                        dialog.pending_name.clear();
-                        dialog.confirm_delete = None;
-                    }
                     let has_selection = dialog.selected.is_some();
-                    if ui
-                        .add_enabled(has_selection, icon_toolbar_button(theme::icons::PEN))
-                        .on_hover_text("Rename")
-                        .clicked()
-                    {
+                    if has_selection && ui.add(theme::secondary_button("Rename")).clicked() {
                         if let Some(path) = dialog.selected.clone() {
                             dialog.pending_name = path
                                 .file_name()
@@ -6317,11 +6369,7 @@ impl SpoonApp {
                         }
                     }
                     let can_delete = has_selection || !dialog.checked.is_empty();
-                    if ui
-                        .add_enabled(can_delete, icon_toolbar_button(theme::icons::TRASH))
-                        .on_hover_text("Delete")
-                        .clicked()
-                    {
+                    if can_delete && ui.add(theme::danger_button("Delete")).clicked() {
                         let targets: Vec<PathBuf> = if dialog.checked.is_empty() {
                             dialog.selected.iter().cloned().collect()
                         } else {
@@ -6332,8 +6380,16 @@ impl SpoonApp {
                     }
                 });
                 dialog.poll_compress();
-                if dialog.compress_task.is_some() {
+                if dialog.compress_task.is_some() || dialog.uncompress_task.is_some() {
                     ui.ctx().request_repaint_after(Duration::from_millis(100));
+                }
+                if dialog.uncompress_task.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            egui::RichText::new("Uncompressing archive…").color(theme::TEXT_MUTED),
+                        );
+                    });
                 }
                 if !dialog.checked.is_empty() {
                     let busy = dialog.compress_task.is_some();
@@ -6348,11 +6404,16 @@ impl SpoonApp {
                             ui.label(egui::RichText::new("Compressing…").color(theme::TEXT_MUTED));
                         }
                         ui.add_enabled_ui(!busy, |ui| {
+                            let compressible = dialog.checked.len() > 1
+                                || dialog.checked.iter().any(|path| path.is_dir());
                             if ui
-                                .add(theme::primary_icon_button(
-                                    theme::icons::FILE_ZIPPER,
-                                    "Compress",
-                                ))
+                                .add_enabled(
+                                    compressible,
+                                    theme::primary_icon_button(
+                                        theme::icons::FILE_ZIPPER,
+                                        "Compress",
+                                    ),
+                                )
                                 .clicked()
                             {
                                 dialog.compress_checked();
@@ -6443,6 +6504,93 @@ impl SpoonApp {
                         });
                     });
                 }
+                if dialog.move_dialog.is_some() {
+                    let root = dialog.root.clone();
+                    let mut navigate: Option<PathBuf> = None;
+                    let mut move_up = false;
+                    let mut confirm = false;
+                    let mut cancel = false;
+                    theme::card().show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        let Some(move_dialog) = &mut dialog.move_dialog else {
+                            return;
+                        };
+                        let name = move_dialog
+                            .source
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        ui.label(
+                            egui::RichText::new(format!("Move {name} to…")).color(theme::TEXT),
+                        );
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            ui.add_enabled_ui(move_dialog.destination != root, |ui| {
+                                if ui.small_button("Up").clicked() {
+                                    move_up = true;
+                                }
+                            });
+                            ui.label(
+                                egui::RichText::new(&move_dialog.display)
+                                    .size(12.0)
+                                    .color(theme::TEXT_MUTED),
+                            );
+                        });
+                        egui::ScrollArea::vertical()
+                            .id_salt("move_destination_folders")
+                            .max_height(160.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                let folders = std::mem::take(&mut move_dialog.subfolders);
+                                for folder in &folders {
+                                    let label = folder
+                                        .file_name()
+                                        .map(|name| name.to_string_lossy().into_owned())
+                                        .unwrap_or_default();
+                                    let job = theme::icon_text_job(
+                                        theme::icons::FOLDER,
+                                        &label,
+                                        theme::TEXT,
+                                    );
+                                    if ui.selectable_label(false, job).clicked() {
+                                        navigate = Some(folder.clone());
+                                    }
+                                }
+                                move_dialog.subfolders = folders;
+                            });
+                        if let Some(err) = &dialog.error {
+                            ui.label(egui::RichText::new(err).color(theme::ERROR));
+                        }
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add(theme::primary_icon_button(theme::icons::CHECK, "Move Here"))
+                                .clicked()
+                            {
+                                confirm = true;
+                            }
+                            if ui
+                                .add(theme::ghost_icon_button(theme::icons::XMARK, "Cancel"))
+                                .clicked()
+                            {
+                                cancel = true;
+                            }
+                        });
+                    });
+                    if let Some(move_dialog) = &mut dialog.move_dialog {
+                        if move_up {
+                            move_dialog.navigate_up(&root);
+                        }
+                        if let Some(folder) = navigate {
+                            move_dialog.navigate_into(folder, &root);
+                        }
+                    }
+                    if confirm {
+                        dialog.confirm_move();
+                    }
+                    if cancel {
+                        dialog.move_dialog = None;
+                    }
+                }
                 ui.add_space(4.0);
                 if !dialog.entries.is_empty() {
                     let all_checked = dialog
@@ -6488,7 +6636,11 @@ impl SpoonApp {
                                         dialog.checked.remove(&entry.path);
                                     }
                                 }
-                                if ui.selectable_label(is_selected, job).clicked() {
+                                let response = ui.selectable_label(is_selected, job);
+                                if response.secondary_clicked() {
+                                    dialog.selected = Some(entry.path.clone());
+                                }
+                                if response.clicked() {
                                     if entry.is_dir {
                                         clicked_dir = true;
                                     } else {
@@ -6496,6 +6648,67 @@ impl SpoonApp {
                                         dialog.open_file(&entry.path);
                                     }
                                 }
+                                response.context_menu(|ui| {
+                                    if ui.button("Open").clicked() {
+                                        if entry.is_dir {
+                                            clicked_dir = true;
+                                        } else {
+                                            dialog.selected = Some(entry.path.clone());
+                                            dialog.open_file(&entry.path);
+                                        }
+                                        ui.close_menu();
+                                    }
+                                    ui.separator();
+                                    if ui.button("Move").clicked() {
+                                        dialog.selected = Some(entry.path.clone());
+                                        dialog.open_move_dialog(entry.path.clone());
+                                        ui.close_menu();
+                                    }
+                                    if ui.button("Rename").clicked() {
+                                        dialog.selected = Some(entry.path.clone());
+                                        dialog.pending_name = entry.name.clone();
+                                        dialog.pending =
+                                            Some(PendingFileOp::Rename(entry.path.clone()));
+                                        dialog.confirm_delete = None;
+                                        ui.close_menu();
+                                    }
+                                    if ui.button("Delete").clicked() {
+                                        dialog.selected = Some(entry.path.clone());
+                                        dialog.confirm_delete = Some(vec![entry.path.clone()]);
+                                        dialog.pending = None;
+                                        ui.close_menu();
+                                    }
+                                    // Compressing one file is pointless; offer it
+                                    // for folders and for multi-file selections.
+                                    if (entry.is_dir || dialog.checked.len() > 1)
+                                        && ui
+                                            .add_enabled(
+                                                dialog.compress_task.is_none(),
+                                                egui::Button::new("Compress"),
+                                            )
+                                            .clicked()
+                                    {
+                                        if entry.is_dir {
+                                            dialog.checked.clear();
+                                            dialog.checked.insert(entry.path.clone());
+                                        }
+                                        dialog.compress_checked();
+                                        ui.close_menu();
+                                    }
+                                    if !entry.is_dir && files::is_archive(&entry.path) {
+                                        ui.separator();
+                                        if ui
+                                            .add_enabled(
+                                                dialog.uncompress_task.is_none(),
+                                                egui::Button::new("Uncompress"),
+                                            )
+                                            .clicked()
+                                        {
+                                            dialog.start_uncompress(entry.path.clone());
+                                            ui.close_menu();
+                                        }
+                                    }
+                                });
                             });
                             if clicked_dir {
                                 navigate = Some(entry.path.clone());
@@ -6738,6 +6951,8 @@ impl SpoonApp {
             }
         }
 
+        self.render_pull_file_dialog(ui.ctx());
+
         if close {
             self.files_dialog = None;
             self.page = ServerPage::Overview;
@@ -6745,6 +6960,144 @@ impl SpoonApp {
         }
         if should_save {
             self.save();
+        }
+    }
+
+    fn render_pull_file_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = self.files_dialog.as_ref() else {
+            return;
+        };
+        if !dialog.pull_dialog_open {
+            return;
+        }
+        let server_id = dialog.server_id.clone();
+        let mut close = false;
+        let mut query = false;
+        let mut download = false;
+        let modal = egui::Modal::new(egui::Id::new(("pull_file_dialog", server_id)))
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::SURFACE)
+                    .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
+                    .corner_radius(egui::CornerRadius::same(12))
+                    .inner_margin(egui::Margin::same(20)),
+            )
+            .backdrop_color(egui::Color32::from_black_alpha(140))
+            .show(ctx, |ui| {
+                ui.set_width(460.0);
+                ui.label(theme::title_with_icon(
+                    theme::icons::DOWNLOAD,
+                    "Pull File",
+                    theme::PRIMARY,
+                ));
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Query a direct file link, then download it into this folder.",
+                    )
+                    .size(13.0)
+                    .color(theme::TEXT_MUTED),
+                );
+                ui.add_space(12.0);
+
+                let dialog = self.files_dialog.as_mut().unwrap();
+                ui.label(
+                    egui::RichText::new("File link")
+                        .size(12.0)
+                        .color(theme::TEXT_MUTED),
+                );
+                let busy = dialog.pull_query_task.is_some() || dialog.pull_download_task.is_some();
+                let url_response = ui.add_enabled(
+                    !busy,
+                    egui::TextEdit::singleline(&mut dialog.pull_url)
+                        .hint_text("https://example.com/file.jar")
+                        .desired_width(f32::INFINITY),
+                );
+                if url_response.changed() {
+                    dialog.pull_info = None;
+                    dialog.pull_error = None;
+                }
+                if url_response.lost_focus()
+                    && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                {
+                    query = true;
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!busy, theme::secondary_button("Query"))
+                        .clicked()
+                    {
+                        query = true;
+                    }
+                    if dialog.pull_query_task.is_some() {
+                        ui.spinner();
+                        ui.label(egui::RichText::new("Querying link…").color(theme::TEXT_MUTED));
+                    } else if dialog.pull_download_task.is_some() {
+                        ui.spinner();
+                        ui.label(egui::RichText::new("Downloading file…").color(theme::TEXT_MUTED));
+                    }
+                });
+
+                if let Some(info) = &dialog.pull_info {
+                    ui.add_space(10.0);
+                    theme::card().show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(
+                            egui::RichText::new(&info.filename)
+                                .strong()
+                                .color(theme::TEXT),
+                        );
+                        let size = info
+                            .size
+                            .map(format_file_size)
+                            .unwrap_or_else(|| "Unknown size".to_string());
+                        ui.label(egui::RichText::new(size).color(theme::TEXT_MUTED));
+                    });
+                }
+                if let Some(error) = &dialog.pull_error {
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new(error).color(theme::ERROR));
+                }
+
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let busy =
+                            dialog.pull_query_task.is_some() || dialog.pull_download_task.is_some();
+                        if ui
+                            .add_enabled(
+                                dialog.pull_info.is_some() && !busy,
+                                theme::primary_button("Download"),
+                            )
+                            .clicked()
+                        {
+                            download = true;
+                        }
+                        if ui
+                            .add_enabled(!busy, theme::ghost_button("Cancel"))
+                            .clicked()
+                        {
+                            close = true;
+                        }
+                    });
+                });
+            });
+
+        if let Some(dialog) = self.files_dialog.as_mut() {
+            let busy = dialog.pull_query_task.is_some() || dialog.pull_download_task.is_some();
+            if busy {
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+            if (modal.should_close() || close) && !busy {
+                dialog.pull_dialog_open = false;
+            }
+            if query {
+                dialog.start_pull_query();
+            }
+            if download {
+                dialog.start_pull_download();
+            }
         }
     }
 
@@ -8741,6 +9094,20 @@ fn format_mb(bytes: u64) -> String {
     format!("{:.0} MB", bytes as f64 / 1024.0 / 1024.0)
 }
 
+fn format_file_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
+}
+
 /// Formats a memory size in MB as "N GB" when it divides evenly, else "N MB".
 fn memory_label(mb: u32) -> String {
     if mb >= 1024 && mb.is_multiple_of(1024) {
@@ -9003,13 +9370,34 @@ struct FilesDialog {
     /// Entries ticked for bulk compress/delete (within the current folder).
     checked: std::collections::BTreeSet<PathBuf>,
     compress_task: Option<Receiver<Result<PathBuf, String>>>,
+    uncompress_task: Option<Receiver<Result<String, String>>>,
+    upload_task: Option<Receiver<Result<PathBuf, String>>>,
+    pull_dialog_open: bool,
+    pull_url: String,
+    pull_info: Option<files::RemoteFileInfo>,
+    pull_error: Option<String>,
+    pull_query_task: Option<Receiver<Result<files::RemoteFileInfo, String>>>,
+    pull_download_task: Option<Receiver<Result<PathBuf, String>>>,
     open: Option<OpenFile>,
     pending: Option<PendingFileOp>,
     pending_name: String,
     confirm_delete: Option<Vec<PathBuf>>,
+    /// Custom "Move to folder" picker; `Some` while it is open.
+    move_dialog: Option<MoveDialogState>,
     /// Set when the user tries to close with unsaved changes.
     confirm_close: bool,
     status: Option<String>,
+}
+
+/// State for the in-app move destination picker.
+struct MoveDialogState {
+    source: PathBuf,
+    /// Folder the picker is showing; always inside the server root.
+    destination: PathBuf,
+    /// Subfolders of `destination` offered as the next destination.
+    subfolders: Vec<PathBuf>,
+    /// `destination` relative to the server root, for display.
+    display: String,
 }
 
 struct OpenFile {
@@ -9036,6 +9424,43 @@ enum PendingFileOp {
     Rename(PathBuf),
 }
 
+impl MoveDialogState {
+    /// Lists the subfolders of `destination`, excluding the source entry and
+    /// anything inside it (an entry can never be moved into itself).
+    fn reload(&mut self, root: &Path) {
+        self.display = match self.destination.strip_prefix(root) {
+            Ok(rel) if rel.as_os_str().is_empty() => "/".to_string(),
+            Ok(rel) => rel.to_string_lossy().replace('\\', "/"),
+            Err(_) => self.destination.display().to_string(),
+        };
+        self.subfolders = files::list_dir(&self.destination)
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .filter(|entry| entry.is_dir && !entry.path.starts_with(&self.source))
+                    .map(|entry| entry.path)
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+
+    fn navigate_into(&mut self, folder: PathBuf, root: &Path) {
+        self.destination = folder;
+        self.reload(root);
+    }
+
+    fn navigate_up(&mut self, root: &Path) {
+        let Some(parent) = self.destination.parent().map(Path::to_path_buf) else {
+            return;
+        };
+        if parent == self.destination || !parent.starts_with(root) {
+            return;
+        }
+        self.destination = parent;
+        self.reload(root);
+    }
+}
+
 impl FilesDialog {
     fn new(config: &ServerConfig) -> Self {
         let root =
@@ -9050,10 +9475,19 @@ impl FilesDialog {
             selected: None,
             checked: Default::default(),
             compress_task: None,
+            uncompress_task: None,
+            upload_task: None,
+            pull_dialog_open: false,
+            pull_url: String::new(),
+            pull_info: None,
+            pull_error: None,
+            pull_query_task: None,
+            pull_download_task: None,
             open: None,
             pending: None,
             pending_name: String::new(),
             confirm_delete: None,
+            move_dialog: None,
             confirm_close: false,
             status: None,
         };
@@ -9068,6 +9502,233 @@ impl FilesDialog {
             Err(err) => {
                 self.entries.clear();
                 self.error = Some(format!("Could not list folder: {err}"));
+            }
+        }
+    }
+
+    fn open_pull_dialog(&mut self) {
+        self.pull_url.clear();
+        self.pull_info = None;
+        self.pull_error = None;
+        self.pull_dialog_open = true;
+    }
+
+    fn start_upload(&mut self, source: PathBuf) {
+        if self.upload_task.is_some() {
+            return;
+        }
+        let directory = self.current.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = files::copy_file_into_dir(&source, &directory)
+                .map_err(|err| format!("Could not upload file: {err}"));
+            let _ = tx.send(result);
+        });
+        self.upload_task = Some(rx);
+    }
+
+    fn start_uncompress(&mut self, archive: PathBuf) {
+        if self.uncompress_task.is_some() {
+            return;
+        }
+        let directory = self.current.clone();
+        let name = archive
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "archive".to_string());
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = files::uncompress_archive(&archive, &directory)
+                .map(|()| name)
+                .map_err(|err| err.to_string());
+            let _ = tx.send(result);
+        });
+        self.uncompress_task = Some(rx);
+    }
+
+    fn open_move_dialog(&mut self, source: PathBuf) {
+        let mut move_dialog = MoveDialogState {
+            destination: self.current.clone(),
+            source,
+            subfolders: Vec::new(),
+            display: String::new(),
+        };
+        let root = self.root.clone();
+        move_dialog.reload(&root);
+        self.move_dialog = Some(move_dialog);
+    }
+
+    /// Applies the picker's destination; closes the picker only when the move
+    /// succeeds, so a failure stays visible next to the picker.
+    fn confirm_move(&mut self) {
+        let Some(move_dialog) = &self.move_dialog else {
+            return;
+        };
+        let (source, destination) = (move_dialog.source.clone(), move_dialog.destination.clone());
+        if self.move_entry(&source, &destination) {
+            self.move_dialog = None;
+        }
+    }
+
+    fn move_entry(&mut self, source: &Path, destination: &Path) -> bool {
+        match files::move_entry(&self.root, source, destination) {
+            Ok(path) => {
+                if path == source {
+                    self.status = Some("Already in this folder.".to_string());
+                    return true;
+                }
+                if self.selected.as_deref() == Some(source) {
+                    self.selected = if path.parent() == Some(self.current.as_path()) {
+                        Some(path.clone())
+                    } else {
+                        None
+                    };
+                }
+                if self.checked.remove(source) && path.parent() == Some(self.current.as_path()) {
+                    self.checked.insert(path.clone());
+                }
+                if let Some(open) = &mut self.open {
+                    if open.path == source {
+                        open.path = path.clone();
+                    }
+                }
+                if self.current.starts_with(source) {
+                    self.current = self.root.clone();
+                    self.open = None;
+                }
+                self.refresh();
+                self.status = path
+                    .file_name()
+                    .map(|name| format!("Moved {}", name.to_string_lossy()));
+                true
+            }
+            Err(err) => {
+                self.error = Some(format!("Could not move: {err}"));
+                false
+            }
+        }
+    }
+
+    fn start_pull_query(&mut self) {
+        if self.pull_query_task.is_some() || self.pull_download_task.is_some() {
+            return;
+        }
+        let url = self.pull_url.trim().to_string();
+        if url.is_empty() {
+            self.pull_error = Some("Enter a file link to query.".to_string());
+            return;
+        }
+        self.pull_info = None;
+        self.pull_error = None;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(files::query_remote_file(&url));
+        });
+        self.pull_query_task = Some(rx);
+    }
+
+    fn start_pull_download(&mut self) {
+        if self.pull_query_task.is_some() || self.pull_download_task.is_some() {
+            return;
+        }
+        if self.pull_info.is_none() {
+            return;
+        }
+        let url = self.pull_url.trim().to_string();
+        let directory = self.current.clone();
+        self.pull_error = None;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(files::download_remote_file(&url, &directory));
+        });
+        self.pull_download_task = Some(rx);
+    }
+
+    fn poll_background_tasks(&mut self) {
+        if let Some(rx) = &self.uncompress_task {
+            match rx.try_recv() {
+                Ok(Ok(name)) => {
+                    self.uncompress_task = None;
+                    self.refresh();
+                    self.status = Some(format!("Uncompressed {name}"));
+                }
+                Ok(Err(err)) => {
+                    self.uncompress_task = None;
+                    self.error = Some(err);
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.uncompress_task = None;
+                    self.error = Some("Uncompress stopped unexpectedly.".to_string());
+                }
+            }
+        }
+
+        if let Some(rx) = &self.upload_task {
+            match rx.try_recv() {
+                Ok(Ok(path)) => {
+                    self.upload_task = None;
+                    if path.parent() == Some(self.current.as_path()) {
+                        self.selected = Some(path.clone());
+                        self.refresh();
+                    }
+                    self.status = path
+                        .file_name()
+                        .map(|name| format!("Uploaded {}", name.to_string_lossy()));
+                }
+                Ok(Err(err)) => {
+                    self.upload_task = None;
+                    self.error = Some(err);
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.upload_task = None;
+                    self.error = Some("Upload stopped unexpectedly.".to_string());
+                }
+            }
+        }
+
+        if let Some(rx) = &self.pull_query_task {
+            match rx.try_recv() {
+                Ok(Ok(info)) => {
+                    self.pull_query_task = None;
+                    self.pull_info = Some(info);
+                    self.pull_error = None;
+                }
+                Ok(Err(err)) => {
+                    self.pull_query_task = None;
+                    self.pull_error = Some(err);
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.pull_query_task = None;
+                    self.pull_error = Some("File query stopped unexpectedly.".to_string());
+                }
+            }
+        }
+
+        if let Some(rx) = &self.pull_download_task {
+            match rx.try_recv() {
+                Ok(Ok(path)) => {
+                    self.pull_download_task = None;
+                    if path.parent() == Some(self.current.as_path()) {
+                        self.selected = Some(path.clone());
+                        self.refresh();
+                    }
+                    self.status = path
+                        .file_name()
+                        .map(|name| format!("Downloaded {}", name.to_string_lossy()));
+                    self.pull_dialog_open = false;
+                }
+                Ok(Err(err)) => {
+                    self.pull_download_task = None;
+                    self.pull_error = Some(err);
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.pull_download_task = None;
+                    self.pull_error = Some("File download stopped unexpectedly.".to_string());
+                }
             }
         }
     }

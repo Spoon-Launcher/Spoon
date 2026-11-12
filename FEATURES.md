@@ -45,11 +45,11 @@ Status: ✅ Done · 🟡 In Progress · ⬜ Planned
 - ⬜ Scheduled restarts / tasks
 - ✅ Backups (backup the server root folder under Spoon/backups)
 - ⬜ Databases (Hook into a database server to allow creation of server specific databases)
-- ⬜ Desktop notifications (server up / down)
+- ✅ Desktop notifications (server up / down)
 - 🟡 Modrinth/Spigot Plugin Installer — Modrinth ✅ · Spigot ⬜
 - 🟡 Modrinth/Curseforge Mod Installer — Modrinth ✅ · Curseforge ⬜
 - ✅ Player Management
-- ✅ File Browser / File editor / Open server folder
+- ✅ File Browser / File editor / Move files / Uncompress archives / Upload & pull remote files / Open server folder
 - ✅ Private Java runtimes
 - ⬜ Playit.gg Tunnel Support
 
