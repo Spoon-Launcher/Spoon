@@ -1,7 +1,7 @@
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 /// Upper size bound for files opened in the built-in editor.
 pub const MAX_EDITABLE_BYTES: u64 = 10 * 1024 * 1024;
@@ -15,6 +15,8 @@ pub struct FileEntry {
     pub path: PathBuf,
     pub is_dir: bool,
     pub size: u64,
+    /// Last modification time when the filesystem provides it.
+    pub modified: Option<SystemTime>,
 }
 
 /// Metadata discovered for a file available at an HTTP(S) URL.
@@ -48,6 +50,7 @@ pub fn list_dir(path: &Path) -> io::Result<Vec<FileEntry>> {
             path: item.path(),
             is_dir: metadata.is_dir(),
             size: metadata.len(),
+            modified: metadata.modified().ok(),
         });
     }
     // Cached keys: one lowercase allocation per entry instead of two per comparison.

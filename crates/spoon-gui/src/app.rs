@@ -6219,7 +6219,6 @@ impl SpoonApp {
     fn render_files_page(&mut self, ui: &mut egui::Ui, index: usize) {
         let server_index = index;
         let server_id = self.servers[server_index].config.id.clone();
-        let server_dir = self.servers[server_index].config.working_dir.clone();
         let server_name = self.servers[server_index].config.name.clone();
         // Recreate the page state if it belongs to a different server.
         let stale = self
@@ -6247,68 +6246,107 @@ impl SpoonApp {
             let dialog = self.files_dialog.as_ref().unwrap();
             file_path_breadcrumbs(&dialog.root, &dialog.current, &server_name)
         };
+        let editor_mode = self.files_dialog.as_ref().unwrap().show_editor;
         let mut breadcrumb_target = None;
+        let mut back_to_files = false;
         let mut open_pull_dialog = false;
         let mut create_file = false;
         let mut create_folder = false;
         let mut choose_upload = false;
         ui.horizontal(|ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing.x = 2.0;
-                ui.spacing_mut().button_padding = egui::vec2(2.0, 0.0);
-                ui.label(egui::RichText::new("/").size(13.0).color(theme::TEXT_MUTED));
-                for (index, (path, name)) in breadcrumbs.iter().enumerate() {
-                    if index > 0 {
-                        ui.label(egui::RichText::new("/").size(13.0).color(theme::TEXT_MUTED));
-                    }
-                    if index + 1 == breadcrumbs.len() {
-                        ui.label(
-                            egui::RichText::new(name)
-                                .size(13.0)
-                                .color(theme::TEXT_MUTED),
-                        );
-                    } else {
-                        let button = theme::animated_button(
-                            egui::Button::new(
-                                egui::RichText::new(name.as_str())
-                                    .size(13.0)
-                                    .color(theme::TEXT),
-                            ),
-                            egui::Color32::TRANSPARENT,
-                            theme::SURFACE_HOVER,
-                            egui::Stroke::NONE,
-                            egui::Stroke::NONE,
-                        );
-                        if ui
-                            .add(button)
-                            .on_hover_cursor(egui::CursorIcon::PointingHand)
-                            .clicked()
-                        {
-                            breadcrumb_target = Some(path.clone());
-                        }
-                    }
-                }
-            });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    if ui.add(theme::primary_button("New File")).clicked() {
-                        create_file = true;
-                    }
-                    if ui.add(theme::primary_button("Upload")).clicked() {
-                        choose_upload = true;
-                    }
+            if editor_mode {
+                ui.horizontal(|ui| {
                     if ui
-                        .add(theme::secondary_button("Create Directory"))
+                        .add(theme::ghost_icon_button(
+                            theme::icons::ARROW_LEFT,
+                            "Back to Files",
+                        ))
                         .clicked()
                     {
-                        create_folder = true;
+                        back_to_files = true;
                     }
-                    if ui.add(theme::secondary_button("Pull File")).clicked() {
-                        open_pull_dialog = true;
+                    if let Some(open) = &self.files_dialog.as_ref().unwrap().open {
+                        let name = open
+                            .path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        ui.label(theme::title_with_icon(
+                            theme::icons::FILE_LINES,
+                            &name,
+                            theme::PRIMARY,
+                        ));
                     }
                 });
-            });
+            } else {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    ui.spacing_mut().button_padding = egui::vec2(2.0, 0.0);
+                    ui.label(egui::RichText::new("/").size(13.0).color(theme::TEXT_MUTED));
+                    for (index, (path, name)) in breadcrumbs.iter().enumerate() {
+                        if index > 0 {
+                            ui.label(egui::RichText::new("/").size(13.0).color(theme::TEXT_MUTED));
+                        }
+                        if index + 1 == breadcrumbs.len() {
+                            ui.label(
+                                egui::RichText::new(name)
+                                    .size(13.0)
+                                    .color(theme::TEXT_MUTED),
+                            );
+                        } else {
+                            let button = theme::animated_button(
+                                egui::Button::new(
+                                    egui::RichText::new(name.as_str())
+                                        .size(13.0)
+                                        .color(theme::TEXT),
+                                ),
+                                egui::Color32::TRANSPARENT,
+                                theme::SURFACE_HOVER,
+                                egui::Stroke::NONE,
+                                egui::Stroke::NONE,
+                            );
+                            if ui
+                                .add(button)
+                                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                                .clicked()
+                            {
+                                breadcrumb_target = Some(path.clone());
+                            }
+                        }
+                    }
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.add(theme::primary_button("New File")).clicked() {
+                            create_file = true;
+                        }
+                        if ui.add(theme::primary_button("Upload")).clicked() {
+                            choose_upload = true;
+                        }
+                        if ui
+                            .add(theme::secondary_button("Create Directory"))
+                            .clicked()
+                        {
+                            create_folder = true;
+                        }
+                        if ui.add(theme::secondary_button("Pull File")).clicked() {
+                            open_pull_dialog = true;
+                        }
+                    });
+                });
+            }
         });
+        if back_to_files {
+            let dialog = self.files_dialog.as_mut().unwrap();
+            if dialog.open_is_dirty() {
+                dialog.error = Some("Save changes before returning to the file list.".to_string());
+            } else {
+                dialog.open = None;
+                dialog.show_editor = false;
+                dialog.error = None;
+            }
+        }
+        let editor_mode = self.files_dialog.as_ref().unwrap().show_editor;
         if let Some(target) = breadcrumb_target {
             self.files_dialog.as_mut().unwrap().navigate_to(&target);
         }
@@ -6340,596 +6378,665 @@ impl SpoonApp {
             }
         }
         ui.add_space(14.0);
-        // Both panes take the height left above the footer.
-        let body_height = (ui.available_height() - 54.0).max(240.0);
+        let body_height = (ui.available_height() - if editor_mode { 54.0 } else { 0.0 }).max(240.0);
         ui.horizontal(|ui| {
-            // Left pane: folder listing and file operations.
-            ui.vertical(|ui| {
-                ui.set_width(340.0);
-                ui.set_height(body_height);
-                let dialog = self.files_dialog.as_mut().unwrap();
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    ui.spacing_mut().button_padding = egui::vec2(8.0, 6.0);
-                    if ui.button("Refresh").clicked() {
-                        dialog.refresh();
+            if !editor_mode {
+                ui.vertical(|ui| {
+                    ui.set_width(ui.available_width());
+                    ui.set_height(body_height);
+                    let dialog = self.files_dialog.as_mut().unwrap();
+                    dialog.poll_compress();
+                    if dialog.compress_task.is_some() || dialog.uncompress_task.is_some() {
+                        ui.ctx().request_repaint_after(Duration::from_millis(100));
                     }
-                    if ui.button("Open Folder").clicked() {
-                        open_directory(&server_dir);
-                    }
-                    let has_selection = dialog.selected.is_some();
-                    if has_selection && ui.add(theme::secondary_button("Rename")).clicked() {
-                        if let Some(path) = dialog.selected.clone() {
-                            dialog.pending_name = path
-                                .file_name()
-                                .map(|name| name.to_string_lossy().into_owned())
-                                .unwrap_or_default();
-                            dialog.pending = Some(PendingFileOp::Rename(path));
-                            dialog.confirm_delete = None;
-                        }
-                    }
-                    let can_delete = has_selection || !dialog.checked.is_empty();
-                    if can_delete && ui.add(theme::danger_button("Delete")).clicked() {
-                        let targets: Vec<PathBuf> = if dialog.checked.is_empty() {
-                            dialog.selected.iter().cloned().collect()
-                        } else {
-                            dialog.checked.iter().cloned().collect()
-                        };
-                        dialog.confirm_delete = Some(targets);
-                        dialog.pending = None;
-                    }
-                });
-                dialog.poll_compress();
-                if dialog.compress_task.is_some() || dialog.uncompress_task.is_some() {
-                    ui.ctx().request_repaint_after(Duration::from_millis(100));
-                }
-                if dialog.uncompress_task.is_some() {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(
-                            egui::RichText::new("Uncompressing archive…").color(theme::TEXT_MUTED),
-                        );
-                    });
-                }
-                if !dialog.checked.is_empty() {
-                    let busy = dialog.compress_task.is_some();
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        ui.label(
-                            egui::RichText::new(format!("{} selected", dialog.checked.len()))
-                                .color(theme::TEXT_MUTED),
-                        );
-                        if busy {
+                    if dialog.uncompress_task.is_some() {
+                        ui.horizontal(|ui| {
                             ui.spinner();
-                            ui.label(egui::RichText::new("Compressing…").color(theme::TEXT_MUTED));
-                        }
-                        ui.add_enabled_ui(!busy, |ui| {
-                            let compressible = dialog.checked.len() > 1
-                                || dialog.checked.iter().any(|path| path.is_dir());
-                            if ui
-                                .add_enabled(
-                                    compressible,
-                                    theme::primary_icon_button(
-                                        theme::icons::FILE_ZIPPER,
-                                        "Compress",
-                                    ),
-                                )
-                                .clicked()
-                            {
-                                dialog.compress_checked();
-                            }
-                            if ui
-                                .add(theme::ghost_icon_button(theme::icons::XMARK, "Clear"))
-                                .clicked()
-                            {
-                                dialog.checked.clear();
-                            }
+                            ui.label(
+                                egui::RichText::new("Uncompressing archive…")
+                                    .color(theme::TEXT_MUTED),
+                            );
                         });
-                    });
-                }
-                if let Some(status) = &dialog.status {
-                    ui.label(
-                        egui::RichText::new(status)
-                            .size(12.0)
-                            .color(theme::TEXT_MUTED),
-                    );
-                }
-                if let Some(err) = &dialog.error {
-                    ui.label(egui::RichText::new(err).color(theme::ERROR));
-                }
-                if dialog.pending.is_some() {
-                    let confirm_label = match dialog.pending {
-                        Some(PendingFileOp::Rename(_)) => "Rename",
-                        _ => "Create",
-                    };
-                    theme::card().show(ui, |ui| {
+                    }
+                    if dialog.compress_task.is_some() {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(egui::RichText::new("Archiving…").color(theme::TEXT_MUTED));
+                        });
+                    }
+                    if let Some(status) = &dialog.status {
                         ui.label(
-                            egui::RichText::new("Name")
+                            egui::RichText::new(status)
                                 .size(12.0)
                                 .color(theme::TEXT_MUTED),
                         );
-                        ui.add(
-                            egui::TextEdit::singleline(&mut dialog.pending_name)
-                                .desired_width(f32::INFINITY),
-                        );
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add(theme::primary_icon_button(
-                                    theme::icons::CHECK,
-                                    confirm_label,
-                                ))
-                                .clicked()
-                            {
-                                match dialog.pending.clone() {
-                                    Some(PendingFileOp::NewFile) => dialog.create_entry(false),
-                                    Some(PendingFileOp::NewFolder) => dialog.create_entry(true),
-                                    Some(PendingFileOp::Rename(from)) => dialog.rename_entry(&from),
-                                    None => {}
-                                }
-                            }
-                            if ui
-                                .add(theme::ghost_icon_button(theme::icons::XMARK, "Cancel"))
-                                .clicked()
-                            {
-                                dialog.pending = None;
-                            }
-                        });
-                    });
-                }
-                if let Some(targets) = dialog.confirm_delete.clone() {
-                    let prompt = match targets.as_slice() {
-                        [only] => format!(
-                            "Delete {}?",
-                            only.file_name()
-                                .map(|name| name.to_string_lossy().into_owned())
-                                .unwrap_or_default()
-                        ),
-                        _ => format!("Delete {} items?", targets.len()),
-                    };
-                    theme::card().show(ui, |ui| {
-                        ui.label(egui::RichText::new(prompt).color(theme::ERROR));
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add(theme::danger_icon_button(theme::icons::TRASH, "Delete"))
-                                .clicked()
-                            {
-                                dialog.delete_entries(&targets);
-                            }
-                            if ui
-                                .add(theme::ghost_icon_button(theme::icons::XMARK, "Cancel"))
-                                .clicked()
-                            {
-                                dialog.confirm_delete = None;
-                            }
-                        });
-                    });
-                }
-                if dialog.move_dialog.is_some() {
-                    let root = dialog.root.clone();
-                    let mut navigate: Option<PathBuf> = None;
-                    let mut move_up = false;
-                    let mut confirm = false;
-                    let mut cancel = false;
-                    theme::card().show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        let Some(move_dialog) = &mut dialog.move_dialog else {
-                            return;
+                    }
+                    if let Some(err) = &dialog.error {
+                        ui.label(egui::RichText::new(err).color(theme::ERROR));
+                    }
+                    if dialog.pending.is_some() {
+                        let confirm_label = match dialog.pending {
+                            Some(PendingFileOp::Rename(_)) => "Rename",
+                            _ => "Create",
                         };
-                        let name = move_dialog
-                            .source
-                            .file_name()
-                            .map(|name| name.to_string_lossy().into_owned())
-                            .unwrap_or_default();
-                        ui.label(
-                            egui::RichText::new(format!("Move {name} to…")).color(theme::TEXT),
-                        );
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 6.0;
-                            ui.add_enabled_ui(move_dialog.destination != root, |ui| {
-                                if ui.small_button("Up").clicked() {
-                                    move_up = true;
-                                }
-                            });
+                        theme::card().show(ui, |ui| {
                             ui.label(
-                                egui::RichText::new(&move_dialog.display)
+                                egui::RichText::new("Name")
                                     .size(12.0)
                                     .color(theme::TEXT_MUTED),
                             );
-                        });
-                        egui::ScrollArea::vertical()
-                            .id_salt("move_destination_folders")
-                            .max_height(160.0)
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                let folders = std::mem::take(&mut move_dialog.subfolders);
-                                for folder in &folders {
-                                    let label = folder
-                                        .file_name()
-                                        .map(|name| name.to_string_lossy().into_owned())
-                                        .unwrap_or_default();
-                                    let job = theme::icon_text_job(
-                                        theme::icons::FOLDER,
-                                        &label,
-                                        theme::TEXT,
-                                    );
-                                    if ui.selectable_label(false, job).clicked() {
-                                        navigate = Some(folder.clone());
+                            ui.add(
+                                egui::TextEdit::singleline(&mut dialog.pending_name)
+                                    .desired_width(f32::INFINITY),
+                            );
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add(theme::primary_icon_button(
+                                        theme::icons::CHECK,
+                                        confirm_label,
+                                    ))
+                                    .clicked()
+                                {
+                                    match dialog.pending.clone() {
+                                        Some(PendingFileOp::NewFile) => dialog.create_entry(false),
+                                        Some(PendingFileOp::NewFolder) => dialog.create_entry(true),
+                                        Some(PendingFileOp::Rename(from)) => {
+                                            dialog.rename_entry(&from)
+                                        }
+                                        None => {}
                                     }
                                 }
-                                move_dialog.subfolders = folders;
+                                if ui
+                                    .add(theme::ghost_icon_button(theme::icons::XMARK, "Cancel"))
+                                    .clicked()
+                                {
+                                    dialog.pending = None;
+                                }
                             });
-                        if let Some(err) = &dialog.error {
-                            ui.label(egui::RichText::new(err).color(theme::ERROR));
+                        });
+                    }
+                    if let Some(targets) = dialog.confirm_delete.clone() {
+                        let prompt = match targets.as_slice() {
+                            [only] => format!(
+                                "Delete {}?",
+                                only.file_name()
+                                    .map(|name| name.to_string_lossy().into_owned())
+                                    .unwrap_or_default()
+                            ),
+                            _ => format!("Delete {} items?", targets.len()),
+                        };
+                        let mut delete = false;
+                        let mut cancel = false;
+                        let modal =
+                            egui::Modal::new(egui::Id::new(("delete_files_dialog", &server_id)))
+                                .frame(
+                                    egui::Frame::new()
+                                        .fill(theme::SURFACE)
+                                        .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
+                                        .corner_radius(egui::CornerRadius::same(12))
+                                        .inner_margin(egui::Margin::same(20)),
+                                )
+                                .backdrop_color(egui::Color32::from_black_alpha(140))
+                                .show(ui.ctx(), |ui| {
+                                    ui.set_width(360.0);
+                                    ui.label(theme::title_with_icon(
+                                        theme::icons::TRASH,
+                                        "Confirm Deletion",
+                                        theme::ERROR,
+                                    ));
+                                    ui.add_space(8.0);
+                                    ui.label(egui::RichText::new(prompt).color(theme::ERROR));
+                                    ui.add_space(12.0);
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .add(theme::danger_icon_button(
+                                                theme::icons::TRASH,
+                                                "Delete",
+                                            ))
+                                            .clicked()
+                                        {
+                                            delete = true;
+                                        }
+                                        if ui
+                                            .add(theme::ghost_icon_button(
+                                                theme::icons::XMARK,
+                                                "Cancel",
+                                            ))
+                                            .clicked()
+                                        {
+                                            cancel = true;
+                                        }
+                                    });
+                                });
+                        if delete {
+                            dialog.delete_entries(&targets);
+                        } else if cancel || modal.should_close() {
+                            dialog.confirm_delete = None;
                         }
+                    }
+                    if dialog.move_dialog.is_some() {
+                        let root = dialog.root.clone();
+                        let mut navigate: Option<PathBuf> = None;
+                        let mut move_up = false;
+                        let mut confirm = false;
+                        let mut cancel = false;
+                        let modal =
+                            egui::Modal::new(egui::Id::new(("move_file_dialog", &server_id)))
+                                .frame(
+                                    egui::Frame::new()
+                                        .fill(theme::SURFACE)
+                                        .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
+                                        .corner_radius(egui::CornerRadius::same(12))
+                                        .inner_margin(egui::Margin::same(20)),
+                                )
+                                .backdrop_color(egui::Color32::from_black_alpha(140))
+                                .show(ui.ctx(), |ui| {
+                                    ui.set_width(420.0);
+                                    let Some(move_dialog) = &mut dialog.move_dialog else {
+                                        return;
+                                    };
+                                    let name = if let [source] = move_dialog.sources.as_slice() {
+                                        source
+                                            .file_name()
+                                            .map(|name| name.to_string_lossy().into_owned())
+                                            .unwrap_or_default()
+                                    } else {
+                                        format!("{} items", move_dialog.sources.len())
+                                    };
+                                    ui.label(
+                                        egui::RichText::new(format!("Move {name} to…"))
+                                            .strong()
+                                            .color(theme::TEXT),
+                                    );
+                                    ui.add_space(10.0);
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 6.0;
+                                        ui.add_enabled_ui(move_dialog.destination != root, |ui| {
+                                            if ui.small_button("Up").clicked() {
+                                                move_up = true;
+                                            }
+                                        });
+                                        ui.label(
+                                            egui::RichText::new(&move_dialog.display)
+                                                .size(12.0)
+                                                .color(theme::TEXT_MUTED),
+                                        );
+                                    });
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("move_destination_folders")
+                                        .max_height(220.0)
+                                        .auto_shrink([false, false])
+                                        .show(ui, |ui| {
+                                            let folders =
+                                                std::mem::take(&mut move_dialog.subfolders);
+                                            for folder in &folders {
+                                                let label = folder
+                                                    .file_name()
+                                                    .map(|name| name.to_string_lossy().into_owned())
+                                                    .unwrap_or_default();
+                                                let job = theme::icon_text_job(
+                                                    theme::icons::FOLDER,
+                                                    &label,
+                                                    theme::TEXT,
+                                                );
+                                                if ui.selectable_label(false, job).clicked() {
+                                                    navigate = Some(folder.clone());
+                                                }
+                                            }
+                                            move_dialog.subfolders = folders;
+                                        });
+                                    if let Some(err) = &dialog.error {
+                                        ui.label(egui::RichText::new(err).color(theme::ERROR));
+                                    }
+                                    ui.add_space(12.0);
+                                    ui.horizontal(|ui| {
+                                        if ui
+                                            .add(theme::primary_icon_button(
+                                                theme::icons::CHECK,
+                                                "Move Here",
+                                            ))
+                                            .clicked()
+                                        {
+                                            confirm = true;
+                                        }
+                                        if ui
+                                            .add(theme::ghost_icon_button(
+                                                theme::icons::XMARK,
+                                                "Cancel",
+                                            ))
+                                            .clicked()
+                                        {
+                                            cancel = true;
+                                        }
+                                    });
+                                });
+                        if let Some(move_dialog) = &mut dialog.move_dialog {
+                            if move_up {
+                                move_dialog.navigate_up(&root);
+                            }
+                            if let Some(folder) = navigate {
+                                move_dialog.navigate_into(folder, &root);
+                            }
+                        }
+                        if confirm {
+                            dialog.confirm_move();
+                        }
+                        if cancel || modal.should_close() {
+                            dialog.move_dialog = None;
+                        }
+                    }
+                    ui.add_space(4.0);
+                    if !dialog.entries.is_empty() {
+                        let all_checked = dialog
+                            .entries
+                            .iter()
+                            .all(|entry| dialog.checked.contains(&entry.path));
+                        let mut select_all = all_checked;
                         ui.horizontal(|ui| {
+                            ui.add_space(14.0);
+                            if file_checkbox(ui, &mut select_all)
+                                .on_hover_text("Select all")
+                                .changed()
+                            {
+                                if select_all {
+                                    let paths: Vec<PathBuf> = dialog
+                                        .entries
+                                        .iter()
+                                        .map(|entry| entry.path.clone())
+                                        .collect();
+                                    dialog.checked.extend(paths);
+                                } else {
+                                    dialog.checked.clear();
+                                }
+                            }
+                            ui.label(
+                                egui::RichText::new("Name")
+                                    .size(12.0)
+                                    .color(theme::TEXT_MUTED),
+                            );
+                            let header_right_inset =
+                                44.0 + 14.0 + ui.style().spacing.scroll.allocated_width();
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.add_space(header_right_inset);
+                                    ui.add_sized(
+                                        egui::vec2(180.0, 20.0),
+                                        egui::Label::new(
+                                            egui::RichText::new("Modified")
+                                                .size(12.0)
+                                                .color(theme::TEXT_MUTED),
+                                        ),
+                                    );
+                                    ui.add_sized(
+                                        egui::vec2(88.0, 20.0),
+                                        egui::Label::new(
+                                            egui::RichText::new("Size")
+                                                .size(12.0)
+                                                .color(theme::TEXT_MUTED),
+                                        ),
+                                    );
+                                },
+                            );
+                        });
+                    }
+                    egui::ScrollArea::vertical()
+                        .id_salt(("files_list", &server_id))
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            let entries = std::mem::take(&mut dialog.entries);
+                            let mut navigate: Option<PathBuf> = None;
+                            for entry in &entries {
+                                let is_selected =
+                                    dialog.selected.as_deref() == Some(entry.path.as_path());
+                                let glyph = if entry.is_dir {
+                                    theme::icons::FOLDER
+                                } else {
+                                    theme::icons::FILE_LINES
+                                };
+                                let job = theme::icon_text_job(
+                                    glyph,
+                                    &entry.name,
+                                    if is_selected {
+                                        theme::PRIMARY
+                                    } else {
+                                        theme::TEXT
+                                    },
+                                );
+                                let archive_enabled = dialog.compress_task.is_none();
+                                let uncompress_enabled = dialog.uncompress_task.is_none();
+                                let mut row_action = None;
+                                theme::card().show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 8.0;
+                                        let mut ticked = dialog.checked.contains(&entry.path);
+                                        if file_checkbox(ui, &mut ticked).changed() {
+                                            if ticked {
+                                                dialog.checked.insert(entry.path.clone());
+                                            } else {
+                                                dialog.checked.remove(&entry.path);
+                                            }
+                                        }
+                                        let trailing_width = 44.0 + 180.0 + 88.0 + 2.0 * 8.0;
+                                        let name_width =
+                                            (ui.available_width() - trailing_width).max(80.0);
+                                        let (name_rect, response) = ui.allocate_exact_size(
+                                            egui::vec2(name_width, 28.0),
+                                            egui::Sense::click(),
+                                        );
+                                        let galley = ui.fonts(|fonts| fonts.layout_job(job));
+                                        let text_pos = egui::pos2(
+                                            name_rect.left(),
+                                            name_rect.center().y - galley.size().y / 2.0,
+                                        );
+                                        ui.painter().with_clip_rect(name_rect).galley(
+                                            text_pos,
+                                            galley,
+                                            theme::TEXT,
+                                        );
+                                        let can_open = file_entry_is_openable(entry);
+                                        let response = if can_open {
+                                            response.on_hover_cursor(egui::CursorIcon::PointingHand)
+                                        } else {
+                                            response
+                                        };
+                                        if response.secondary_clicked() {
+                                            dialog.selected = Some(entry.path.clone());
+                                        }
+                                        if response.clicked() && can_open {
+                                            row_action = Some(FileEntryAction::Open);
+                                        }
+                                        response.context_menu(|ui| {
+                                            row_action = file_entry_menu(
+                                                ui,
+                                                entry,
+                                                archive_enabled,
+                                                uncompress_enabled,
+                                            );
+                                        });
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.push_id(&entry.path, |ui| {
+                                                    ui.menu_button(
+                                                        theme::icon(theme::icons::ELLIPSIS, 16.0)
+                                                            .color(theme::TEXT_MUTED),
+                                                        |ui| {
+                                                            row_action = file_entry_menu(
+                                                                ui,
+                                                                entry,
+                                                                archive_enabled,
+                                                                uncompress_enabled,
+                                                            );
+                                                        },
+                                                    );
+                                                });
+                                                ui.add_sized(
+                                                    egui::vec2(180.0, 20.0),
+                                                    egui::Label::new(
+                                                        egui::RichText::new(format_file_modified(
+                                                            entry.modified,
+                                                        ))
+                                                        .size(12.0)
+                                                        .color(theme::TEXT_MUTED),
+                                                    ),
+                                                );
+                                                let size = if entry.is_dir {
+                                                    String::new()
+                                                } else {
+                                                    format_file_size(entry.size)
+                                                };
+                                                ui.add_sized(
+                                                    egui::vec2(88.0, 20.0),
+                                                    egui::Label::new(
+                                                        egui::RichText::new(size)
+                                                            .size(12.0)
+                                                            .color(theme::TEXT_MUTED),
+                                                    ),
+                                                );
+                                            },
+                                        );
+                                    });
+                                });
+                                if let Some(action) = row_action {
+                                    if matches!(action, FileEntryAction::Open) && entry.is_dir {
+                                        navigate = Some(entry.path.clone());
+                                        break;
+                                    }
+                                    apply_file_entry_action(dialog, entry, action);
+                                }
+                                ui.add_space(4.0);
+                            }
+                            match navigate {
+                                Some(dir) => dialog.navigate_to(&dir),
+                                None => dialog.entries = entries,
+                            }
+                        });
+                });
+            }
+            if editor_mode {
+                ui.vertical(|ui| {
+                    ui.set_width(ui.available_width());
+                    ui.set_height(body_height);
+                    let dialog = self.files_dialog.as_mut().unwrap();
+                    if let Some(open) = &mut dialog.open {
+                        let file_name = open
+                            .path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        let dirty = open.content != open.saved_content;
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            ui.label(
+                                theme::icon(theme::icons::FILE_LINES, 14.0).color(theme::PRIMARY),
+                            );
+                            ui.label(egui::RichText::new(file_name).strong());
+                            if dirty {
+                                ui.label(egui::RichText::new("●").color(theme::PRIMARY));
+                            }
+                            if open.read_only {
+                                ui.label(
+                                    egui::RichText::new("read-only")
+                                        .size(11.0)
+                                        .color(theme::TEXT_MUTED),
+                                );
+                            }
+                            if let Some(status) = &dialog.status {
+                                ui.label(
+                                    egui::RichText::new(status)
+                                        .size(11.0)
+                                        .color(theme::TEXT_MUTED),
+                                );
+                            }
+                        });
+                        if let Some(error) = &dialog.error {
+                            ui.label(egui::RichText::new(error).color(theme::ERROR));
+                        }
+                        if let Some(note) = &open.note {
+                            ui.label(egui::RichText::new(note).color(theme::TEXT_MUTED));
+                        }
+                        ui.add_space(4.0);
+                        if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
+                            if let Some(search) = &mut open.search {
+                                search.focus = true;
+                            }
+                        }
+                        let mut matches: Vec<(usize, usize)> = Vec::new();
+                        let mut jump = false;
+                        if let Some(search) = &mut open.search {
+                            matches = find_matches(&open.content, &search.query);
+                            ui.horizontal(|ui| {
+                                let edit = ui.add(
+                                    egui::TextEdit::singleline(&mut search.query)
+                                        .hint_text("Find in file")
+                                        .desired_width(220.0),
+                                );
+                                if search.focus {
+                                    edit.request_focus();
+                                    search.focus = false;
+                                }
+                                let (enter, shift, escape) = ui.input(|i| {
+                                    (
+                                        i.key_pressed(egui::Key::Enter),
+                                        i.modifiers.shift,
+                                        i.key_pressed(egui::Key::Escape),
+                                    )
+                                });
+                                let len = matches.len();
+                                let mut step_next = false;
+                                let mut step_prev = false;
+                                if edit.changed() {
+                                    search.current = 0;
+                                    matches = find_matches(&open.content, &search.query);
+                                    jump = true;
+                                }
+                                if edit.lost_focus() && enter {
+                                    step_next = !shift;
+                                    step_prev = shift;
+                                    edit.request_focus();
+                                }
+                                if edit.has_focus() && escape && !search.query.is_empty() {
+                                    search.query.clear();
+                                    search.current = 0;
+                                    matches.clear();
+                                }
+                                if ui.small_button("Prev").clicked() {
+                                    step_prev = true;
+                                }
+                                if ui.small_button("Next").clicked() {
+                                    step_next = true;
+                                }
+                                if len > 0 {
+                                    if step_next {
+                                        search.current = (search.current + 1) % len;
+                                        jump = true;
+                                    } else if step_prev {
+                                        search.current = (search.current + len - 1) % len;
+                                        jump = true;
+                                    }
+                                }
+                                if !search.query.is_empty() {
+                                    let label = if matches.is_empty() {
+                                        "No results".to_string()
+                                    } else {
+                                        format!(
+                                            "{}/{}",
+                                            search.current.min(matches.len() - 1) + 1,
+                                            matches.len()
+                                        )
+                                    };
+                                    ui.label(egui::RichText::new(label).color(theme::TEXT_MUTED));
+                                }
+                            });
+                            if !matches.is_empty() {
+                                search.current = search.current.min(matches.len() - 1);
+                            }
+                            ui.add_space(4.0);
+                        }
+                        let current = open.search.as_ref().map(|search| search.current);
+                        ui.add_enabled_ui(!open.read_only, |ui| {
+                            let height = ui.available_height().max(120.0);
+                            // Highlight known formats; very large files stay plain
+                            // to keep typing responsive.
+                            let language =
+                                open.language.filter(|_| open.content.len() <= 512 * 1024);
+                            let match_ranges = &matches;
+                            let mut layouter = move |ui: &egui::Ui, text: &str, wrap_width: f32| {
+                                let job = syntax_job(ui, text, language, wrap_width);
+                                let job = highlight_matches(job, text, match_ranges, current);
+                                ui.fonts(|fonts| fonts.layout_job(job))
+                            };
+                            let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
+                            let rows = ((height / row_height) as usize).max(4);
+                            egui::ScrollArea::vertical()
+                                .id_salt("file_editor_scroll")
+                                .auto_shrink([false, false])
+                                .max_height(height)
+                                .show(ui, |ui| {
+                                    let output = egui::TextEdit::multiline(&mut open.content)
+                                        .font(egui::TextStyle::Monospace)
+                                        .desired_width(f32::INFINITY)
+                                        .desired_rows(rows)
+                                        .layouter(&mut layouter)
+                                        .show(ui);
+                                    if jump {
+                                        if let Some(&(start, _)) =
+                                            current.and_then(|c| matches.get(c))
+                                        {
+                                            let index = open.content[..start].chars().count();
+                                            let rect = output
+                                                .galley
+                                                .pos_from_ccursor(egui::text::CCursor::new(index))
+                                                .translate(output.galley_pos.to_vec2());
+                                            ui.scroll_to_rect(rect, Some(egui::Align::Center));
+                                        }
+                                    }
+                                });
+                        });
+                    } else {
+                        ui.label(
+                            egui::RichText::new("Select a file to view or edit.")
+                                .color(theme::TEXT_MUTED),
+                        );
+                    }
+                });
+            }
+        });
+        // Footer pinned to the bottom of the page.
+        if editor_mode {
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let dialog = self.files_dialog.as_mut().unwrap();
+                        if dialog.confirm_close {
                             if ui
-                                .add(theme::primary_icon_button(theme::icons::CHECK, "Move Here"))
+                                .add(theme::danger_icon_button(
+                                    theme::icons::TRASH,
+                                    "Discard & Close",
+                                ))
                                 .clicked()
                             {
-                                confirm = true;
+                                close = true;
                             }
                             if ui
                                 .add(theme::ghost_icon_button(theme::icons::XMARK, "Cancel"))
                                 .clicked()
                             {
-                                cancel = true;
+                                dialog.confirm_close = false;
                             }
-                        });
-                    });
-                    if let Some(move_dialog) = &mut dialog.move_dialog {
-                        if move_up {
-                            move_dialog.navigate_up(&root);
-                        }
-                        if let Some(folder) = navigate {
-                            move_dialog.navigate_into(folder, &root);
-                        }
-                    }
-                    if confirm {
-                        dialog.confirm_move();
-                    }
-                    if cancel {
-                        dialog.move_dialog = None;
-                    }
-                }
-                ui.add_space(4.0);
-                if !dialog.entries.is_empty() {
-                    let all_checked = dialog
-                        .entries
-                        .iter()
-                        .all(|entry| dialog.checked.contains(&entry.path));
-                    let mut select_all = all_checked;
-                    if ui.checkbox(&mut select_all, "Select all").changed() {
-                        if select_all {
-                            let paths: Vec<PathBuf> =
-                                dialog.entries.iter().map(|e| e.path.clone()).collect();
-                            dialog.checked.extend(paths);
                         } else {
-                            dialog.checked.clear();
-                        }
-                    }
-                }
-                egui::ScrollArea::vertical()
-                    .id_salt(("files_list", &server_id))
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        // Take the listing out so rows don't clone it every
-                        // frame; it is restored below, or replaced when a
-                        // folder click triggers navigation.
-                        let entries = std::mem::take(&mut dialog.entries);
-                        let mut navigate: Option<PathBuf> = None;
-                        for entry in &entries {
-                            let is_selected =
-                                dialog.selected.as_deref() == Some(entry.path.as_path());
-                            let glyph = if entry.is_dir {
-                                theme::icons::FOLDER
-                            } else {
-                                theme::icons::FILE_LINES
-                            };
-                            let job = theme::icon_text_job(glyph, &entry.name, theme::TEXT);
-                            let mut clicked_dir = false;
-                            ui.horizontal(|ui| {
-                                let mut ticked = dialog.checked.contains(&entry.path);
-                                if ui.checkbox(&mut ticked, "").changed() {
-                                    if ticked {
-                                        dialog.checked.insert(entry.path.clone());
-                                    } else {
-                                        dialog.checked.remove(&entry.path);
-                                    }
-                                }
-                                let response = ui.selectable_label(is_selected, job);
-                                if response.secondary_clicked() {
-                                    dialog.selected = Some(entry.path.clone());
-                                }
-                                if response.clicked() {
-                                    if entry.is_dir {
-                                        clicked_dir = true;
-                                    } else {
-                                        dialog.selected = Some(entry.path.clone());
-                                        dialog.open_file(&entry.path);
-                                    }
-                                }
-                                response.context_menu(|ui| {
-                                    if ui.button("Open").clicked() {
-                                        if entry.is_dir {
-                                            clicked_dir = true;
-                                        } else {
-                                            dialog.selected = Some(entry.path.clone());
-                                            dialog.open_file(&entry.path);
-                                        }
-                                        ui.close_menu();
-                                    }
-                                    ui.separator();
-                                    if ui.button("Move").clicked() {
-                                        dialog.selected = Some(entry.path.clone());
-                                        dialog.open_move_dialog(entry.path.clone());
-                                        ui.close_menu();
-                                    }
-                                    if ui.button("Rename").clicked() {
-                                        dialog.selected = Some(entry.path.clone());
-                                        dialog.pending_name = entry.name.clone();
-                                        dialog.pending =
-                                            Some(PendingFileOp::Rename(entry.path.clone()));
-                                        dialog.confirm_delete = None;
-                                        ui.close_menu();
-                                    }
-                                    if ui.button("Delete").clicked() {
-                                        dialog.selected = Some(entry.path.clone());
-                                        dialog.confirm_delete = Some(vec![entry.path.clone()]);
-                                        dialog.pending = None;
-                                        ui.close_menu();
-                                    }
-                                    // Compressing one file is pointless; offer it
-                                    // for folders and for multi-file selections.
-                                    if (entry.is_dir || dialog.checked.len() > 1)
-                                        && ui
-                                            .add_enabled(
-                                                dialog.compress_task.is_none(),
-                                                egui::Button::new("Compress"),
-                                            )
-                                            .clicked()
-                                    {
-                                        if entry.is_dir {
-                                            dialog.checked.clear();
-                                            dialog.checked.insert(entry.path.clone());
-                                        }
-                                        dialog.compress_checked();
-                                        ui.close_menu();
-                                    }
-                                    if !entry.is_dir && files::is_archive(&entry.path) {
-                                        ui.separator();
-                                        if ui
-                                            .add_enabled(
-                                                dialog.uncompress_task.is_none(),
-                                                egui::Button::new("Uncompress"),
-                                            )
-                                            .clicked()
-                                        {
-                                            dialog.start_uncompress(entry.path.clone());
-                                            ui.close_menu();
-                                        }
-                                    }
-                                });
+                            let can_save = dialog.open.as_ref().is_some_and(|open| {
+                                !open.read_only && open.content != open.saved_content
                             });
-                            if clicked_dir {
-                                navigate = Some(entry.path.clone());
-                                break;
-                            }
-                        }
-                        match navigate {
-                            Some(dir) => dialog.navigate_to(&dir),
-                            None => dialog.entries = entries,
-                        }
-                    });
-            });
-            // Right pane: text editor for the open file.
-            ui.vertical(|ui| {
-                ui.set_width(ui.available_width());
-                ui.set_height(body_height);
-                let dialog = self.files_dialog.as_mut().unwrap();
-                if let Some(open) = &mut dialog.open {
-                    let file_name = open
-                        .path
-                        .file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    let dirty = open.content != open.saved_content;
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        ui.label(theme::icon(theme::icons::FILE_LINES, 14.0).color(theme::PRIMARY));
-                        ui.label(egui::RichText::new(file_name).strong());
-                        if dirty {
-                            ui.label(egui::RichText::new("●").color(theme::PRIMARY));
-                        }
-                        if open.read_only {
-                            ui.label(
-                                egui::RichText::new("read-only")
-                                    .size(11.0)
-                                    .color(theme::TEXT_MUTED),
-                            );
-                        }
-                        if let Some(status) = &dialog.status {
-                            ui.label(
-                                egui::RichText::new(status)
-                                    .size(11.0)
-                                    .color(theme::TEXT_MUTED),
-                            );
-                        }
-                    });
-                    if let Some(note) = &open.note {
-                        ui.label(egui::RichText::new(note).color(theme::TEXT_MUTED));
-                    }
-                    ui.add_space(4.0);
-                    if ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
-                        if let Some(search) = &mut open.search {
-                            search.focus = true;
-                        }
-                    }
-                    let mut matches: Vec<(usize, usize)> = Vec::new();
-                    let mut jump = false;
-                    if let Some(search) = &mut open.search {
-                        matches = find_matches(&open.content, &search.query);
-                        ui.horizontal(|ui| {
-                            let edit = ui.add(
-                                egui::TextEdit::singleline(&mut search.query)
-                                    .hint_text("Find in file")
-                                    .desired_width(220.0),
-                            );
-                            if search.focus {
-                                edit.request_focus();
-                                search.focus = false;
-                            }
-                            let (enter, shift, escape) = ui.input(|i| {
-                                (
-                                    i.key_pressed(egui::Key::Enter),
-                                    i.modifiers.shift,
-                                    i.key_pressed(egui::Key::Escape),
+                            if ui
+                                .add_enabled(
+                                    can_save,
+                                    theme::primary_icon_button(theme::icons::SAVE, "Save"),
                                 )
-                            });
-                            let len = matches.len();
-                            let mut step_next = false;
-                            let mut step_prev = false;
-                            if edit.changed() {
-                                search.current = 0;
-                                matches = find_matches(&open.content, &search.query);
-                                jump = true;
+                                .clicked()
+                            {
+                                save_file = true;
                             }
-                            if edit.lost_focus() && enter {
-                                step_next = !shift;
-                                step_prev = shift;
-                                edit.request_focus();
-                            }
-                            if edit.has_focus() && escape && !search.query.is_empty() {
-                                search.query.clear();
-                                search.current = 0;
-                                matches.clear();
-                            }
-                            if ui.small_button("Prev").clicked() {
-                                step_prev = true;
-                            }
-                            if ui.small_button("Next").clicked() {
-                                step_next = true;
-                            }
-                            if len > 0 {
-                                if step_next {
-                                    search.current = (search.current + 1) % len;
-                                    jump = true;
-                                } else if step_prev {
-                                    search.current = (search.current + len - 1) % len;
-                                    jump = true;
-                                }
-                            }
-                            if !search.query.is_empty() {
-                                let label = if matches.is_empty() {
-                                    "No results".to_string()
+                            if ui
+                                .add(theme::ghost_icon_button(
+                                    theme::icons::XMARK,
+                                    "Close Browser",
+                                ))
+                                .clicked()
+                            {
+                                if dialog.open_is_dirty() {
+                                    dialog.confirm_close = true;
                                 } else {
-                                    format!(
-                                        "{}/{}",
-                                        search.current.min(matches.len() - 1) + 1,
-                                        matches.len()
-                                    )
-                                };
-                                ui.label(egui::RichText::new(label).color(theme::TEXT_MUTED));
-                            }
-                        });
-                        if !matches.is_empty() {
-                            search.current = search.current.min(matches.len() - 1);
-                        }
-                        ui.add_space(4.0);
-                    }
-                    let current = open.search.as_ref().map(|search| search.current);
-                    ui.add_enabled_ui(!open.read_only, |ui| {
-                        let height = ui.available_height().max(120.0);
-                        // Highlight known formats; very large files stay plain
-                        // to keep typing responsive.
-                        let language = open.language.filter(|_| open.content.len() <= 512 * 1024);
-                        let match_ranges = &matches;
-                        let mut layouter = move |ui: &egui::Ui, text: &str, wrap_width: f32| {
-                            let job = syntax_job(ui, text, language, wrap_width);
-                            let job = highlight_matches(job, text, match_ranges, current);
-                            ui.fonts(|fonts| fonts.layout_job(job))
-                        };
-                        let row_height = ui.text_style_height(&egui::TextStyle::Monospace);
-                        let rows = ((height / row_height) as usize).max(4);
-                        egui::ScrollArea::vertical()
-                            .id_salt("file_editor_scroll")
-                            .auto_shrink([false, false])
-                            .max_height(height)
-                            .show(ui, |ui| {
-                                let output = egui::TextEdit::multiline(&mut open.content)
-                                    .font(egui::TextStyle::Monospace)
-                                    .desired_width(f32::INFINITY)
-                                    .desired_rows(rows)
-                                    .layouter(&mut layouter)
-                                    .show(ui);
-                                if jump {
-                                    if let Some(&(start, _)) = current.and_then(|c| matches.get(c))
-                                    {
-                                        let index = open.content[..start].chars().count();
-                                        let rect = output
-                                            .galley
-                                            .pos_from_ccursor(egui::text::CCursor::new(index))
-                                            .translate(output.galley_pos.to_vec2());
-                                        ui.scroll_to_rect(rect, Some(egui::Align::Center));
-                                    }
+                                    close = true;
                                 }
-                            });
-                    });
-                } else {
-                    ui.label(
-                        egui::RichText::new("Select a file to view or edit.")
-                            .color(theme::TEXT_MUTED),
-                    );
-                }
-            });
-        });
-        // Footer pinned to the bottom of the page.
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
-            ui.horizontal(|ui| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let dialog = self.files_dialog.as_mut().unwrap();
-                    if dialog.confirm_close {
-                        if ui
-                            .add(theme::danger_icon_button(
-                                theme::icons::TRASH,
-                                "Discard & Close",
-                            ))
-                            .clicked()
-                        {
-                            close = true;
-                        }
-                        if ui
-                            .add(theme::ghost_icon_button(theme::icons::XMARK, "Cancel"))
-                            .clicked()
-                        {
-                            dialog.confirm_close = false;
-                        }
-                    } else {
-                        let can_save = dialog.open.as_ref().is_some_and(|open| {
-                            !open.read_only && open.content != open.saved_content
-                        });
-                        if ui
-                            .add_enabled(
-                                can_save,
-                                theme::primary_icon_button(theme::icons::SAVE, "Save"),
-                            )
-                            .clicked()
-                        {
-                            save_file = true;
-                        }
-                        if ui
-                            .add(theme::ghost_icon_button(theme::icons::XMARK, "Close"))
-                            .clicked()
-                        {
-                            if dialog.open_is_dirty() {
-                                dialog.confirm_close = true;
-                            } else {
-                                close = true;
                             }
                         }
-                    }
+                    });
                 });
             });
-        });
+        }
 
         if save_file {
             let mut saved_properties = false;
@@ -6948,6 +7055,100 @@ impl SpoonApp {
                 let entry = &mut self.servers[server_index];
                 entry.max_players = read_max_players(&entry.config.working_dir);
                 should_save = true;
+            }
+        }
+
+        if !editor_mode {
+            let dialog = self.files_dialog.as_mut().unwrap();
+            if !dialog.checked.is_empty()
+                && dialog.confirm_delete.is_none()
+                && dialog.move_dialog.is_none()
+                && dialog.pending.is_none()
+                && !dialog.pull_dialog_open
+            {
+                let selected_count = dialog.checked.len();
+                let can_archive = dialog.compress_task.is_none();
+                let can_move = dialog.compress_task.is_none();
+                let mut move_selected = false;
+                let mut archive = false;
+                let mut delete = false;
+                let mut clear = false;
+                egui::Area::new(egui::Id::new(("file_selection_controls", &server_id)))
+                    .order(egui::Order::Foreground)
+                    .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-20.0, -20.0))
+                    .show(ui.ctx(), |ui| {
+                        egui::Frame::new()
+                            .fill(theme::SURFACE)
+                            .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
+                            .corner_radius(egui::CornerRadius::same(14))
+                            .inner_margin(egui::Margin::symmetric(12, 8))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!("{selected_count} selected"))
+                                            .size(12.0)
+                                            .color(theme::TEXT_MUTED),
+                                    );
+                                    if ui
+                                        .add_enabled(
+                                            can_move,
+                                            theme::secondary_icon_button(
+                                                theme::icons::ARROW_RIGHT,
+                                                "Move",
+                                            ),
+                                        )
+                                        .clicked()
+                                    {
+                                        move_selected = true;
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            can_archive,
+                                            theme::primary_icon_button(
+                                                theme::icons::FILE_ZIPPER,
+                                                "Archive",
+                                            ),
+                                        )
+                                        .clicked()
+                                    {
+                                        archive = true;
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            can_archive,
+                                            theme::danger_icon_button(
+                                                theme::icons::TRASH,
+                                                "Delete",
+                                            ),
+                                        )
+                                        .clicked()
+                                    {
+                                        delete = true;
+                                    }
+                                    if ui
+                                        .add(theme::ghost_icon_button(
+                                            theme::icons::XMARK,
+                                            "Clear selection",
+                                        ))
+                                        .clicked()
+                                    {
+                                        clear = true;
+                                    }
+                                });
+                            });
+                    });
+                if move_selected {
+                    let paths = dialog.checked.iter().cloned().collect::<Vec<_>>();
+                    dialog.open_move_dialog(paths);
+                } else if archive {
+                    let paths = dialog.checked.iter().cloned().collect::<Vec<_>>();
+                    dialog.archive_entries(&paths);
+                } else if delete {
+                    dialog.confirm_delete = Some(dialog.checked.iter().cloned().collect());
+                    dialog.pending = None;
+                } else if clear {
+                    dialog.checked.clear();
+                }
             }
         }
 
@@ -9108,6 +9309,16 @@ fn format_file_size(bytes: u64) -> String {
     format!("{value:.1} {}", UNITS[unit])
 }
 
+fn format_file_modified(modified: Option<std::time::SystemTime>) -> String {
+    modified
+        .map(|time| {
+            chrono::DateTime::<chrono::Local>::from(time)
+                .format("%b %d, %Y %I:%M %p")
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
 /// Formats a memory size in MB as "N GB" when it divides evenly, else "N MB".
 fn memory_label(mb: u32) -> String {
     if mb >= 1024 && mb.is_multiple_of(1024) {
@@ -9367,7 +9578,7 @@ struct FilesDialog {
     entries: Vec<FileEntry>,
     error: Option<String>,
     selected: Option<PathBuf>,
-    /// Entries ticked for bulk compress/delete (within the current folder).
+    /// Entries ticked for bulk archive/delete (within the current folder).
     checked: std::collections::BTreeSet<PathBuf>,
     compress_task: Option<Receiver<Result<PathBuf, String>>>,
     uncompress_task: Option<Receiver<Result<String, String>>>,
@@ -9379,6 +9590,7 @@ struct FilesDialog {
     pull_query_task: Option<Receiver<Result<files::RemoteFileInfo, String>>>,
     pull_download_task: Option<Receiver<Result<PathBuf, String>>>,
     open: Option<OpenFile>,
+    show_editor: bool,
     pending: Option<PendingFileOp>,
     pending_name: String,
     confirm_delete: Option<Vec<PathBuf>>,
@@ -9391,7 +9603,7 @@ struct FilesDialog {
 
 /// State for the in-app move destination picker.
 struct MoveDialogState {
-    source: PathBuf,
+    sources: Vec<PathBuf>,
     /// Folder the picker is showing; always inside the server root.
     destination: PathBuf,
     /// Subfolders of `destination` offered as the next destination.
@@ -9417,6 +9629,165 @@ struct FileSearch {
     focus: bool,
 }
 
+#[derive(Clone, Copy)]
+enum FileEntryAction {
+    Open,
+    Rename,
+    Move,
+    Archive,
+    Delete,
+    Uncompress,
+}
+
+fn file_checkbox(ui: &mut egui::Ui, checked: &mut bool) -> egui::Response {
+    ui.scope(|ui| {
+        let widgets = &mut ui.visuals_mut().widgets;
+        widgets.inactive.corner_radius = egui::CornerRadius::same(3);
+        widgets.hovered.corner_radius = egui::CornerRadius::same(3);
+        widgets.active.corner_radius = egui::CornerRadius::same(3);
+        widgets.open.corner_radius = egui::CornerRadius::same(3);
+        ui.checkbox(checked, "")
+    })
+    .inner
+}
+
+fn file_entry_is_openable(entry: &files::FileEntry) -> bool {
+    entry.is_dir
+        || (!files::is_archive(&entry.path)
+            && !entry
+                .path
+                .extension()
+                .is_some_and(|extension| extension.to_string_lossy().eq_ignore_ascii_case("jar")))
+}
+
+fn file_entry_menu(
+    ui: &mut egui::Ui,
+    entry: &files::FileEntry,
+    archive_enabled: bool,
+    uncompress_enabled: bool,
+) -> Option<FileEntryAction> {
+    let mut action = None;
+    let open_icon = if entry.is_dir {
+        theme::icons::FOLDER_OPEN
+    } else {
+        theme::icons::FILE_LINES
+    };
+    if ui
+        .add_enabled(
+            file_entry_is_openable(entry),
+            egui::Button::new(theme::icon_text_job(open_icon, "Open", theme::TEXT)),
+        )
+        .clicked()
+    {
+        action = Some(FileEntryAction::Open);
+    }
+    ui.separator();
+    if ui
+        .button(theme::icon_text_job(
+            theme::icons::PEN,
+            "Rename",
+            theme::TEXT,
+        ))
+        .clicked()
+    {
+        action = Some(FileEntryAction::Rename);
+    }
+    if ui
+        .button(theme::icon_text_job(
+            theme::icons::ARROW_RIGHT,
+            "Move",
+            theme::TEXT,
+        ))
+        .clicked()
+    {
+        action = Some(FileEntryAction::Move);
+    }
+    if ui
+        .add_enabled(
+            archive_enabled,
+            egui::Button::new(theme::icon_text_job(
+                theme::icons::FILE_ZIPPER,
+                "Archive",
+                theme::TEXT,
+            )),
+        )
+        .clicked()
+    {
+        action = Some(FileEntryAction::Archive);
+    }
+    if ui
+        .button(theme::icon_text_job(
+            theme::icons::TRASH,
+            "Delete",
+            theme::ERROR,
+        ))
+        .clicked()
+    {
+        action = Some(FileEntryAction::Delete);
+    }
+    if !entry.is_dir && files::is_archive(&entry.path) {
+        ui.separator();
+        if ui
+            .add_enabled(
+                uncompress_enabled,
+                egui::Button::new(theme::icon_text_job(
+                    theme::icons::ARCHIVE,
+                    "Uncompress",
+                    theme::TEXT,
+                )),
+            )
+            .clicked()
+        {
+            action = Some(FileEntryAction::Uncompress);
+        }
+    }
+    if action.is_some() {
+        ui.close_menu();
+    }
+    action
+}
+
+fn apply_file_entry_action(
+    dialog: &mut FilesDialog,
+    entry: &files::FileEntry,
+    action: FileEntryAction,
+) {
+    dialog.selected = Some(entry.path.clone());
+    match action {
+        FileEntryAction::Open => {
+            if entry.is_dir {
+                dialog.navigate_to(&entry.path);
+            } else if file_entry_is_openable(entry) {
+                dialog.open_file(&entry.path);
+            }
+        }
+        FileEntryAction::Rename => {
+            dialog.pending_name = entry.name.clone();
+            dialog.pending = Some(PendingFileOp::Rename(entry.path.clone()));
+            dialog.confirm_delete = None;
+        }
+        FileEntryAction::Move => dialog.open_move_dialog(vec![entry.path.clone()]),
+        FileEntryAction::Archive => {
+            let paths = if dialog.checked.contains(&entry.path) {
+                dialog.checked.iter().cloned().collect::<Vec<_>>()
+            } else {
+                vec![entry.path.clone()]
+            };
+            dialog.archive_entries(&paths);
+        }
+        FileEntryAction::Delete => {
+            let targets = if dialog.checked.contains(&entry.path) {
+                dialog.checked.iter().cloned().collect()
+            } else {
+                vec![entry.path.clone()]
+            };
+            dialog.confirm_delete = Some(targets);
+            dialog.pending = None;
+        }
+        FileEntryAction::Uncompress => dialog.start_uncompress(entry.path.clone()),
+    }
+}
+
 #[derive(Clone)]
 enum PendingFileOp {
     NewFile,
@@ -9425,8 +9796,7 @@ enum PendingFileOp {
 }
 
 impl MoveDialogState {
-    /// Lists the subfolders of `destination`, excluding the source entry and
-    /// anything inside it (an entry can never be moved into itself).
+    /// Lists destination subfolders, excluding any selected source and its descendants.
     fn reload(&mut self, root: &Path) {
         self.display = match self.destination.strip_prefix(root) {
             Ok(rel) if rel.as_os_str().is_empty() => "/".to_string(),
@@ -9437,7 +9807,13 @@ impl MoveDialogState {
             .map(|entries| {
                 entries
                     .into_iter()
-                    .filter(|entry| entry.is_dir && !entry.path.starts_with(&self.source))
+                    .filter(|entry| {
+                        entry.is_dir
+                            && !self
+                                .sources
+                                .iter()
+                                .any(|source| entry.path.starts_with(source))
+                    })
                     .map(|entry| entry.path)
                     .collect()
             })
@@ -9484,6 +9860,7 @@ impl FilesDialog {
             pull_query_task: None,
             pull_download_task: None,
             open: None,
+            show_editor: false,
             pending: None,
             pending_name: String::new(),
             confirm_delete: None,
@@ -9546,10 +9923,10 @@ impl FilesDialog {
         self.uncompress_task = Some(rx);
     }
 
-    fn open_move_dialog(&mut self, source: PathBuf) {
+    fn open_move_dialog(&mut self, sources: Vec<PathBuf>) {
         let mut move_dialog = MoveDialogState {
             destination: self.current.clone(),
-            source,
+            sources,
             subfolders: Vec::new(),
             display: String::new(),
         };
@@ -9558,53 +9935,71 @@ impl FilesDialog {
         self.move_dialog = Some(move_dialog);
     }
 
-    /// Applies the picker's destination; closes the picker only when the move
-    /// succeeds, so a failure stays visible next to the picker.
+    /// Moves the selected entries and leaves any failures in the picker.
     fn confirm_move(&mut self) {
         let Some(move_dialog) = &self.move_dialog else {
             return;
         };
-        let (source, destination) = (move_dialog.source.clone(), move_dialog.destination.clone());
-        if self.move_entry(&source, &destination) {
-            self.move_dialog = None;
-        }
-    }
-
-    fn move_entry(&mut self, source: &Path, destination: &Path) -> bool {
-        match files::move_entry(&self.root, source, destination) {
-            Ok(path) => {
-                if path == source {
-                    self.status = Some("Already in this folder.".to_string());
-                    return true;
-                }
-                if self.selected.as_deref() == Some(source) {
-                    self.selected = if path.parent() == Some(self.current.as_path()) {
-                        Some(path.clone())
-                    } else {
-                        None
-                    };
-                }
-                if self.checked.remove(source) && path.parent() == Some(self.current.as_path()) {
-                    self.checked.insert(path.clone());
-                }
-                if let Some(open) = &mut self.open {
-                    if open.path == source {
-                        open.path = path.clone();
+        let sources = move_dialog.sources.clone();
+        let destination = move_dialog.destination.clone();
+        let total = sources.len();
+        let root = self.root.clone();
+        let current = self.current.clone();
+        self.error = None;
+        self.status = None;
+        let mut moved = 0;
+        let mut failures = Vec::new();
+        for source in sources {
+            match files::move_entry(&root, &source, &destination) {
+                Ok(path) if path != source => {
+                    moved += 1;
+                    self.checked.remove(&source);
+                    if self.selected.as_deref() == Some(source.as_path()) {
+                        self.selected = None;
+                    }
+                    if let Some(open) = &mut self.open {
+                        if open.path == source {
+                            open.path = path;
+                        }
+                    }
+                    if current.starts_with(&source) {
+                        self.current = root.clone();
+                        self.open = None;
+                        self.show_editor = false;
                     }
                 }
-                if self.current.starts_with(source) {
-                    self.current = self.root.clone();
-                    self.open = None;
-                }
-                self.refresh();
-                self.status = path
-                    .file_name()
-                    .map(|name| format!("Moved {}", name.to_string_lossy()));
-                true
+                Ok(_) => {}
+                Err(err) => failures.push((source, err)),
             }
-            Err(err) => {
-                self.error = Some(format!("Could not move: {err}"));
-                false
+        }
+        self.refresh();
+        if failures.is_empty() {
+            self.move_dialog = None;
+            self.status = if moved == 0 {
+                Some("Already in this folder.".to_string())
+            } else if moved == 1 {
+                Some("Moved 1 item.".to_string())
+            } else {
+                Some(format!("Moved {moved} items."))
+            };
+        } else {
+            let (source, err) = &failures[0];
+            let name = source
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let more = failures.len().saturating_sub(1);
+            self.error = Some(if more == 0 {
+                format!("Could not move {name}: {err}")
+            } else {
+                format!("Could not move {name}: {err} (and {more} more failed).")
+            });
+            if moved > 0 {
+                self.status = Some(format!("Moved {moved} of {total} items."));
+            }
+            if let Some(move_dialog) = &mut self.move_dialog {
+                move_dialog.sources = failures.into_iter().map(|(source, _)| source).collect();
+                move_dialog.reload(&root);
             }
         }
     }
@@ -9746,15 +10141,22 @@ impl FilesDialog {
         self.selected = None;
         self.checked.clear();
         self.open = None;
+        self.show_editor = false;
         self.refresh();
     }
 
     fn open_file(&mut self, path: &Path) {
+        if self.open.as_ref().is_some_and(|open| open.path == path) {
+            self.show_editor = true;
+            self.error = None;
+            return;
+        }
         if self.open_is_dirty() {
             self.error = Some("Save or discard the open file's changes first.".to_string());
             return;
         }
         self.open = None;
+        self.show_editor = false;
         self.status = None;
         match files::read_file(path) {
             Ok(FileContent::Text(content)) => {
@@ -9791,6 +10193,7 @@ impl FilesDialog {
             }
             Err(err) => self.error = Some(format!("Could not read file: {err}")),
         }
+        self.show_editor = self.open.is_some();
     }
 
     fn create_entry(&mut self, is_dir: bool) {
@@ -9864,6 +10267,7 @@ impl FilesDialog {
             }
             if self.open.as_ref().map(|open| open.path.as_path()) == Some(path.as_path()) {
                 self.open = None;
+                self.show_editor = false;
             }
             if self.current.starts_with(path) {
                 self.current = self.root.clone();
@@ -9876,12 +10280,15 @@ impl FilesDialog {
         }
     }
 
-    /// Zips the ticked entries into the current folder on a background thread.
-    fn compress_checked(&mut self) {
+    /// Creates a ZIP archive from the selected paths in the current folder.
+    fn archive_entries(&mut self, paths: &[PathBuf]) {
         if self.compress_task.is_some() {
             return;
         }
-        let items: Vec<PathBuf> = self.checked.iter().cloned().collect();
+        if paths.is_empty() {
+            return;
+        }
+        let items = paths.to_vec();
         let base = if items.len() == 1 {
             items[0]
                 .file_stem()
@@ -11457,14 +11864,82 @@ fn install_server_version(
 #[cfg(test)]
 mod tests {
     use super::{
-        file_path_breadcrumbs, format_duration, insert_motd_code, parse_motd,
-        parse_online_player_list, show_create_page_scroll_area, sidebar_footer_height,
+        file_entry_is_openable, file_path_breadcrumbs, format_duration, insert_motd_code,
+        parse_motd, parse_online_player_list, show_create_page_scroll_area, sidebar_footer_height,
         update_online_players, valid_resource_pack_url, MotdRun,
     };
     use std::cell::{Cell, RefCell};
     use std::collections::BTreeSet;
     use std::path::Path;
     use std::time::Duration;
+
+    #[test]
+    fn archive_files_are_not_openable_from_the_file_list() {
+        for name in [
+            "server.jar",
+            "world.zip",
+            "backup.tar",
+            "backup.tar.gz",
+            "backup.tgz",
+            "logs.gz",
+        ] {
+            let entry = spoon_core::files::FileEntry {
+                name: name.to_string(),
+                path: Path::new("server").join(name),
+                is_dir: false,
+                size: 0,
+                modified: None,
+            };
+            assert!(!file_entry_is_openable(&entry), "{name} should not open");
+        }
+
+        let editable_file = spoon_core::files::FileEntry {
+            name: "server.properties".to_string(),
+            path: Path::new("server").join("server.properties"),
+            is_dir: false,
+            size: 0,
+            modified: None,
+        };
+        assert!(file_entry_is_openable(&editable_file));
+
+        let directory = spoon_core::files::FileEntry {
+            name: "world".to_string(),
+            path: Path::new("server").join("world"),
+            is_dir: true,
+            size: 0,
+            modified: None,
+        };
+        assert!(file_entry_is_openable(&directory));
+    }
+
+    #[test]
+    fn move_dialog_moves_multiple_selected_entries() {
+        let root = std::env::temp_dir().join(format!("spoon-move-test-{}", super::new_id()));
+        let destination = root.join("destination");
+        std::fs::create_dir_all(&destination).unwrap();
+        let first = root.join("first.txt");
+        let second = root.join("second.txt");
+        std::fs::write(&first, "first").unwrap();
+        std::fs::write(&second, "second").unwrap();
+        let config = super::ServerConfig::new(
+            super::new_id(),
+            "Test".into(),
+            root.join("server.jar"),
+            root.clone(),
+            4096,
+        );
+        let mut dialog = super::FilesDialog::new(&config);
+        dialog.open_move_dialog(vec![first.clone(), second.clone()]);
+        dialog.move_dialog.as_mut().unwrap().destination = destination.clone();
+
+        dialog.confirm_move();
+
+        assert!(destination.join("first.txt").is_file());
+        assert!(destination.join("second.txt").is_file());
+        assert!(dialog.move_dialog.is_none());
+        assert_eq!(dialog.status.as_deref(), Some("Moved 2 items."));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn content_version(index: usize) -> spoon_core::modrinth::ProjectVersion {
         spoon_core::modrinth::ProjectVersion {
